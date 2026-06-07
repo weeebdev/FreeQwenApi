@@ -9,8 +9,31 @@ FreeQwenApi ships a Coolify-compatible `docker-compose.yml`. Coolify rejects env
 3. **Environment variables** (minimum):
    - `SKIP_ACCOUNT_MENU=true`
    - `PORT=3264` (must match the exposed port)
+   - **Accounts** (pick one):
+     - `QWEN_ACCOUNTS_JSON=[{"id":"acc_1","token":"..."},{"id":"acc_2","token":"..."}]`
+     - or `QWEN_TOKENS=token1,token2` (comma-separated, auto ids)
+     - Set `QWEN_ACCOUNTS_OVERWRITE=true` to replace tokens on each deploy
 4. Assign a domain to the `qwen-proxy` service; Coolify routes traffic to port **3264**.
 5. Deploy.
+
+## Extract tokens (browser console)
+
+Log into [chat.qwen.ai](https://chat.qwen.ai) in each account (use separate profiles/incognito). Paste in DevTools console:
+
+```javascript
+(() => {
+  const token = localStorage.getItem('token');
+  if (!token) return console.error('Not logged in — open chat.qwen.ai and sign in first');
+  const entry = { id: 'acc_' + Date.now(), token, resetAt: null };
+  console.log('Single account entry:\n', JSON.stringify(entry, null, 2));
+  const w = window.__qwenAccounts = window.__qwenAccounts || [];
+  w.push(entry);
+  console.log('Collected accounts (' + w.length + '). Copy for QWEN_ACCOUNTS_JSON:\n', JSON.stringify(w, null, 2));
+  try { copy(JSON.stringify(w)); console.log('Copied to clipboard'); } catch {}
+})();
+```
+
+Run once per account. The last log line is your `QWEN_ACCOUNTS_JSON` value for Coolify.
 
 ## Persistent storage
 

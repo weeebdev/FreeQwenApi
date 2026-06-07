@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { logError } from '../logger/index.js';
+import { logError, logInfo } from '../logger/index.js';
 import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +35,69 @@ export function saveTokens(tokens) {
     } catch (e) {
         logError('TokenManager: ошибка сохранения tokens.json', e);
     }
+}
+
+function writeAccountTokenFile(id, token) {
+    const accountDir = path.join(ACCOUNTS_PATH, id);
+    if (!fs.existsSync(accountDir)) fs.mkdirSync(accountDir, { recursive: true });
+    fs.writeFileSync(path.join(accountDir, 'token.txt'), token, 'utf8');
+}
+
+/**
+ * Seed session/tokens.json from env (Coolify-friendly).
+ * QWEN_ACCOUNTS_JSON: [{"id":"acc_1","token":"..."},{"token":"..."}]
+ * QWEN_TOKENS: comma-separated bearer tokens (auto ids acc_env_1, acc_env_2, ...)
+ * Existing file tokens are kept unless QWEN_ACCOUNTS_OVERWRITE=true.
+ */
+export function bootstrapTokensFromEnv() {
+    const overwrite = ['1', 'true', 'yes', 'on'].includes(
+        (process.env.QWEN_ACCOUNTS_OVERWRITE || '').trim().toLowerCase()
+    );
+    const existing = loadTokens();
+    if (existing.length && !overwrite) return false;
+
+    let entries = [];
+
+    const jsonRaw = process.env.QWEN_ACCOUNTS_JSON?.trim();
+    if (jsonRaw) {
+        try {
+            const parsed = JSON.parse(jsonRaw);
+            if (!Array.isArray(parsed) || !parsed.length) {
+                logError('QWEN_ACCOUNTS_JSON: expected a non-empty JSON array');
+                return false;
+            }
+            entries = parsed;
+        } catch (e) {
+            logError('QWEN_ACCOUNTS_JSON: invalid JSON', e);
+            return false;
+        }
+    } else {
+        const csv = process.env.QWEN_TOKENS?.trim();
+        if (csv) entries = csv.split(',').map(t => t.trim()).filter(Boolean);
+    }
+
+    if (!entries.length) return false;
+
+    let tokens;
+    try {
+        tokens = entries.map((entry, index) => {
+            const token = typeof entry === 'string' ? entry : entry?.token;
+            if (!token || typeof token !== 'string') {
+                throw new Error(`Account at index ${index} is missing a token string`);
+            }
+            const id = (typeof entry === 'object' && entry?.id) ? entry.id : `acc_env_${index + 1}`;
+            return { id, token, resetAt: null, invalid: false };
+        });
+    } catch (e) {
+        logError('Failed to parse account tokens from environment', e);
+        return false;
+    }
+
+    ensureSessionDir();
+    saveTokens(tokens);
+    for (const { id, token } of tokens) writeAccountTokenFile(id, token);
+    logInfo(`Bootstrapped ${tokens.length} account(s) from environment`);
+    return true;
 }
 
 export async function getAvailableToken() {
