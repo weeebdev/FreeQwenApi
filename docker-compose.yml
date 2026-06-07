@@ -13,6 +13,9 @@ services:
       HOST: ${HOST:-0.0.0.0}
       SKIP_ACCOUNT_MENU: ${SKIP_ACCOUNT_MENU:-true}
       CHROME_PATH: ${CHROME_PATH:-/usr/bin/chromium}
+      QWEN_ACCOUNTS_JSON: ${QWEN_ACCOUNTS_JSON:-}
+      QWEN_TOKENS: ${QWEN_TOKENS:-}
+      QWEN_ACCOUNTS_OVERWRITE: ${QWEN_ACCOUNTS_OVERWRITE:-false}
     # expose:
       # - "3264"
     volumes:
