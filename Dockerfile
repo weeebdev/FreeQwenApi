@@ -10,9 +10,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Install before NODE_ENV=production — Coolify may inject production at build time.
+# package-lock.json is committed for reproducible Coolify/Docker builds.
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY . .
 
