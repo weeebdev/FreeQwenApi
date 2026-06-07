@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1.6
 FROM node:20-slim AS base
 
-ARG NODE_ENV=production
-
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation libatk-bridge2.0-0 libatk1.0-0 \
@@ -10,15 +8,10 @@ RUN apt-get update \
       libxdamage1 libxrandr2 xdg-utils ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    CHROME_PATH=/usr/bin/chromium \
-    NODE_ENV=${NODE_ENV} \
-    PORT=3264 \
-    HOST=0.0.0.0
-
 WORKDIR /app
 
-COPY package*.json ./
+# Install before NODE_ENV=production — Coolify may inject production at build time.
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY . .
@@ -26,6 +19,12 @@ COPY . .
 RUN mkdir -p /app/session /app/logs /app/uploads \
  && useradd -m appuser \
  && chown -R appuser:appuser /app
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    CHROME_PATH=/usr/bin/chromium \
+    NODE_ENV=production \
+    PORT=3264 \
+    HOST=0.0.0.0
 
 USER appuser
 

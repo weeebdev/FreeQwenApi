@@ -13,6 +13,8 @@ FreeQwenApi ships a Coolify-compatible `docker-compose.yml`. Coolify rejects env
      - `QWEN_ACCOUNTS_JSON=[{"id":"acc_1","token":"..."},{"id":"acc_2","token":"..."}]`
      - or `QWEN_TOKENS=token1,token2` (comma-separated, auto ids)
      - Set `QWEN_ACCOUNTS_OVERWRITE=true` to replace tokens on each deploy
+   - Mark account vars (`QWEN_ACCOUNTS_JSON`, `QWEN_TOKENS`, `QWEN_ACCOUNTS_OVERWRITE`) as **Runtime only** in Coolify — they are not needed at build time.
+   - If build fails on `npm ci`, ensure `NODE_ENV` is **Runtime only** (not build-time).
 4. Assign a domain to the `qwen-proxy` service; Coolify routes traffic to port **3264**.
 5. Deploy.
 
