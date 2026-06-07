@@ -4,7 +4,6 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ${IMAGE_NAME:-qwen-api-proxy}:${IMAGE_TAG:-latest}
-    container_name: ${CONTAINER_NAME:-qwen-proxy}
     env_file:
       - path: .env
         required: false
@@ -14,23 +13,16 @@ services:
       HOST: ${HOST:-0.0.0.0}
       SKIP_ACCOUNT_MENU: ${SKIP_ACCOUNT_MENU:-true}
       CHROME_PATH: ${CHROME_PATH:-/usr/bin/chromium}
-    # ports:
-      # - "${HOST_PORT:-3264}:${PORT:-3264}"
+    # expose:
+      # - "3264"
     volumes:
-      - ${SESSION_VOLUME:-./session}:/app/${SESSION_DIR:-session}
-      - ${LOGS_VOLUME:-./logs}:/app/${LOGS_DIR:-logs}
-      - ${UPLOADS_VOLUME:-./uploads}:/app/${UPLOADS_DIR:-uploads}
+      - session_data:/app/session
+      - logs_data:/app/logs
+      - uploads_data:/app/uploads
     shm_size: ${SHM_SIZE:-1gb}
     restart: ${RESTART_POLICY:-unless-stopped}
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:' + (process.env.PORT || 3264) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 90s
+
+volumes:
+  session_data:
+  logs_data:
+  uploads_data:

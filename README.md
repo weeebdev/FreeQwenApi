@@ -310,13 +310,18 @@ services:
     environment:
       - SKIP_ACCOUNT_MENU=true
       - PORT=3264
-    ports:
-      - "3264:3264"
     volumes:
-      - ./session:/app/session
-      - ./logs:/app/logs
-      - ./uploads:/app/uploads
+      - session_data:/app/session
+      - logs_data:/app/logs
+      - uploads_data:/app/uploads
+
+volumes:
+  session_data:
+  logs_data:
+  uploads_data:
 ```
+
+For local bind mounts to `./session`, copy `docker-compose.override.example.yml` to `docker-compose.override.yml`. For Coolify deployment, see [docs/COOLIFY.md](docs/COOLIFY.md).
 
 ## Рекомендуемые модели
 

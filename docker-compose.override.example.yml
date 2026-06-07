@@ -1,0 +1,8 @@
+# Optional local override: copy to docker-compose.override.yml
+# Binds host directories so `npm run auth` session files are used directly.
+services:
+  qwen-proxy:
+    volumes:
+      - ./session:/app/session
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
