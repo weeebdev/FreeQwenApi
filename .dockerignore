@@ -8,3 +8,6 @@ uploads
 *.log
 patch-cline.bat
 start.bat
+.env
+.env.*
+!.env.example

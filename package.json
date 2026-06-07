@@ -19,7 +19,10 @@
         "example:streaming-test": "node examples/streaming-test.js",
         "auth": "node scripts/auth.js",
         "models:sync": "node scripts/sync_models.js",
-        "smoke": "node scripts/smoke_test.js"
+        "smoke": "node scripts/smoke_test.js",
+        "docker:up": "docker compose up --build -d",
+        "docker:down": "docker compose down",
+        "docker:logs": "docker compose logs -f qwen-proxy"
     },
     "dependencies": {
         "ali-oss": "^6.23.0",
