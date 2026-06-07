@@ -25,15 +25,17 @@ Log into [chat.qwen.ai](https://chat.qwen.ai) in each account (use separate prof
   const token = localStorage.getItem('token');
   if (!token) return console.error('Not logged in — open chat.qwen.ai and sign in first');
   const entry = { id: 'acc_' + Date.now(), token, resetAt: null };
-  console.log('Single account entry:\n', JSON.stringify(entry, null, 2));
   const w = window.__qwenAccounts = window.__qwenAccounts || [];
   w.push(entry);
-  console.log('Collected accounts (' + w.length + '). Copy for QWEN_ACCOUNTS_JSON:\n', JSON.stringify(w, null, 2));
-  try { copy(JSON.stringify(w)); console.log('Copied to clipboard'); } catch {}
+  const json = JSON.stringify(w);
+  const envLine = 'QWEN_ACCOUNTS_JSON=' + json;
+  console.log('Accounts:', w.length);
+  console.log(envLine);
+  try { copy(envLine); console.log('Copied env line to clipboard'); } catch { try { copy(json); console.log('Copied JSON to clipboard'); } catch {} }
 })();
 ```
 
-Run once per account. The last log line is your `QWEN_ACCOUNTS_JSON` value for Coolify.
+Run once per account. Copy the single-line `QWEN_ACCOUNTS_JSON=...` into Coolify env vars.
 
 ## Persistent storage
 
