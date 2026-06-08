@@ -2,7 +2,7 @@ import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus } f
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken } from './tokenManager.js';
+import { getAvailableToken, assignChatAccount, markRateLimited, removeInvalidToken } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -311,11 +311,11 @@ function validateAndPrepareMessage(message) {
     return { error: 'Неподдерживаемый формат сообщения' };
 }
 
-async function resolveAuthToken(browserContext) {
-    const tokenObj = await getAvailableToken();
+async function resolveAuthToken(browserContext, chatId = null) {
+    const tokenObj = await getAvailableToken(chatId);
     if (tokenObj && tokenObj.token) {
         authToken = tokenObj.token;
-        logInfo(`Используется аккаунт: ${tokenObj.id}`);
+        logInfo(`Используется аккаунт: ${tokenObj.id}${chatId ? ` (chatId=${chatId})` : ''}`);
         return tokenObj;
     }
 
@@ -767,9 +767,16 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     if (!chatId) {
-        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType);
+        // Pre-select the account BEFORE creating the chat so the chat is owned by
+        // the same account that will send the first message (sticky routing).
+        const preToken = await getAvailableToken(null);
+        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, preToken?.id ?? null);
         if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
         chatId = newChatResult.chatId;
+        // Bind this chatId to the account so all subsequent turns use the same login.
+        if (chatId && newChatResult.accountId) {
+            assignChatAccount(chatId, newChatResult.accountId);
+        }
         logInfo(`Создан новый чат v2 с ID: ${chatId}`);
     }
 
@@ -795,7 +802,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
 
-    const tokenObj = await resolveAuthToken(browserContext);
+    const tokenObj = await resolveAuthToken(browserContext, chatId);
     if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
     let page = null;
@@ -1005,13 +1012,24 @@ export function getAuthToken() {
 
 // ─── createChatV2 ────────────────────────────────────────────────────────────
 
-export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t') {
+export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t', preferredAccountId = null) {
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован' };
 
-    const tokenObj = await getAvailableToken();
+    // Use a preferred account when the caller has already committed to one (sticky routing).
+    const tokenObj = preferredAccountId
+        ? (await (async () => {
+              const { loadTokens } = await import('./tokenManager.js');
+              const all = loadTokens();
+              const t = all.find(t => t.id === preferredAccountId && !t.invalid && (!t.resetAt || new Date(t.resetAt).getTime() <= Date.now()));
+              return t || await getAvailableToken(null);
+          })())
+        : await getAvailableToken(null);
+
+    let usedAccountId = null;
     if (tokenObj?.token) {
         authToken = tokenObj.token;
+        usedAccountId = tokenObj.id;
         logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
     }
 
@@ -1046,15 +1064,16 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         page = null;
 
         if (result.success && result.data.success) {
-            logInfo(`Чат создан: ${result.data.data.id}`);
-            return { success: true, chatId: result.data.data.id, requestId: result.data.request_id };
+            const chatId = result.data.data.id;
+            logInfo(`Чат создан: ${chatId}`);
+            return { success: true, chatId, accountId: usedAccountId, requestId: result.data.request_id };
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
         if (isTransient && retryCount < MAX_RETRY_COUNT) {
             logWarn(`Создание чата: ${result.status}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`);
             await delay(RETRY_DELAY);
-            return createChatV2(model, title, retryCount + 1, chatType);
+            return createChatV2(model, title, retryCount + 1, chatType, preferredAccountId);
         }
 
         const cleanError = isTransient

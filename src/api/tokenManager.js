@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { logError, logInfo } from '../logger/index.js';
+import { logError, logInfo, logWarn } from '../logger/index.js';
 import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -10,7 +10,18 @@ const SESSION_PATH = path.resolve(__dirname, '..', '..', SESSION_DIR);
 const ACCOUNTS_PATH = path.join(SESSION_PATH, ACCOUNTS_DIR);
 const TOKENS_FILE = path.join(SESSION_PATH, 'tokens.json');
 
-let pointer = 0;
+// ─── In-memory load-balancer state ───────────────────────────────────────────
+// Resets on restart — that's intentional. Cold-start distributes evenly.
+
+/** @type {Map<string, { lastUsedAt: number, requestCount: number }>} */
+const accountStats = new Map();
+
+/** @type {Map<string, { accountId: string, assignedAt: number }>} */
+const chatAccountMap = new Map();
+
+// Configurable via env — read once at module load so they're hot during requests.
+const CHAT_STICKY_TTL_MS = Number(process.env.CHAT_STICKY_TTL_MS) || 60 * 60 * 1000; // 1h
+const ACCOUNT_COOLDOWN_MS = Number(process.env.ACCOUNT_COOLDOWN_MS) || 500; // ms gap before reusing same account
 
 function ensureSessionDir() {
     if (!fs.existsSync(SESSION_PATH)) fs.mkdirSync(SESSION_PATH, { recursive: true });
@@ -100,14 +111,107 @@ export function bootstrapTokensFromEnv() {
     return true;
 }
 
-export async function getAvailableToken() {
-    const tokens = loadTokens();
+// ─── Load balancer internals ─────────────────────────────────────────────────
+
+function getStats(id) {
+    if (!accountStats.has(id)) accountStats.set(id, { lastUsedAt: 0, requestCount: 0 });
+    return accountStats.get(id);
+}
+
+/**
+ * Pick the best account from `valid` using LRU + cooldown preference + jitter.
+ * Jitter (±200ms noise on the lastUsedAt score) prevents synchronised patterns
+ * when multiple requests arrive at the same moment.
+ */
+function pickAccount(valid) {
+    if (valid.length === 1) return valid[0];
+
     const now = Date.now();
+
+    const scored = valid.map(t => {
+        const stats = getStats(t.id);
+        const idleMs = now - stats.lastUsedAt;
+        const cooledDown = ACCOUNT_COOLDOWN_MS === 0 || idleMs >= ACCOUNT_COOLDOWN_MS;
+        // Jitter range: 0–200ms added to lastUsedAt — keeps distribution fuzzy
+        const jitter = Math.random() * 200;
+        return { token: t, cooledDown, score: stats.lastUsedAt + jitter };
+    });
+
+    // Prefer accounts that have sat idle longer than ACCOUNT_COOLDOWN_MS
+    const cooled = scored.filter(s => s.cooledDown);
+    const pool = cooled.length > 0 ? cooled : scored;
+    pool.sort((a, b) => a.score - b.score);
+    return pool[0].token;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Get the next available token.
+ *
+ * @param {string|null} chatId - When provided, the same account is reused for
+ *   the lifetime of the conversation (sticky routing). Falls back to LRU if the
+ *   sticky account is no longer valid.
+ */
+export async function getAvailableToken(chatId = null) {
+    const now = Date.now();
+    const tokens = loadTokens();
     const valid = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
     if (!valid.length) return null;
-    const token = valid[pointer % valid.length];
-    pointer = (pointer + 1) % valid.length;
-    return token;
+
+    // Sticky routing: reuse the account that was assigned to this chatId.
+    if (chatId) {
+        const sticky = chatAccountMap.get(chatId);
+        if (sticky && (now - sticky.assignedAt) < CHAT_STICKY_TTL_MS) {
+            const stickyToken = valid.find(t => t.id === sticky.accountId);
+            if (stickyToken) {
+                const stats = getStats(stickyToken.id);
+                stats.lastUsedAt = now;
+                stats.requestCount++;
+                return stickyToken;
+            }
+            // Sticky account is no longer valid; re-assign.
+            chatAccountMap.delete(chatId);
+            logWarn(`Sticky account for chat ${chatId} unavailable, reassigning`);
+        }
+    }
+
+    const selected = pickAccount(valid);
+    const stats = getStats(selected.id);
+    stats.lastUsedAt = now;
+    stats.requestCount++;
+    logInfo(`LB selected account: ${selected.id} (requestCount=${stats.requestCount})`);
+
+    if (chatId) {
+        chatAccountMap.set(chatId, { accountId: selected.id, assignedAt: now });
+    }
+
+    return selected;
+}
+
+/**
+ * Explicitly bind a chatId to an account after chat creation.
+ * Call this right after createChatV2 succeeds so subsequent messages in the
+ * same conversation always land on the account that owns the Qwen chat.
+ */
+export function assignChatAccount(chatId, accountId) {
+    if (chatId && accountId) {
+        chatAccountMap.set(chatId, { accountId, assignedAt: Date.now() });
+    }
+}
+
+/** Remove a chatId → account binding (e.g. on explicit new-chat). */
+export function releaseChatAccount(chatId) {
+    if (chatId) chatAccountMap.delete(chatId);
+}
+
+/** Return per-account request counts for the /status endpoint. */
+export function getAccountUsageStats() {
+    const result = {};
+    for (const [id, stats] of accountStats.entries()) {
+        result[id] = { requestCount: stats.requestCount, lastUsedAt: stats.lastUsedAt };
+    }
+    return result;
 }
 
 export function hasValidTokens() {

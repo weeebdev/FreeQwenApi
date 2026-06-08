@@ -34,6 +34,12 @@ export const MAX_RETRY_COUNT = Number(process.env.MAX_RETRY_COUNT) || 3;
 export const TASK_POLL_MAX_ATTEMPTS = Number(process.env.TASK_POLL_MAX_ATTEMPTS) || 90;
 export const TASK_POLL_INTERVAL = Number(process.env.TASK_POLL_INTERVAL) || 2_000;
 
+// ─── Load balancer ───────────────────────────────────────────────────────────
+// Minimum ms before the same account can be picked again (0 = no cooldown).
+export const ACCOUNT_COOLDOWN_MS = Number(process.env.ACCOUNT_COOLDOWN_MS) || 500;
+// How long a chatId→account sticky binding lives (ms). Refresh on every use.
+export const CHAT_STICKY_TTL_MS = Number(process.env.CHAT_STICKY_TTL_MS) || 60 * 60 * 1000; // 1h
+
 // ─── Пути (относительно корня проекта) ───────────────────────────────────────
 export const SESSION_DIR = process.env.SESSION_DIR || 'session';
 export const ACCOUNTS_DIR = 'accounts';

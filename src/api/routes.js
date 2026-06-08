@@ -12,7 +12,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { listTokens, markInvalid, markRateLimited, markValid } from './tokenManager.js';
+import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 
 // Функция для генерирования детерминированного chatId на основе истории
@@ -973,6 +973,13 @@ router.get('/status', async (req, res) => {
             else { accInfo.status = 'ERROR'; }
             return accInfo;
         }));
+
+        // Merge in-memory request counts into account info.
+        const usageStats = getAccountUsageStats();
+        for (const acc of accounts) {
+            const stats = usageStats[acc.id];
+            if (stats) acc.requestCount = stats.requestCount;
+        }
 
         const browserContext = getBrowserContext();
         if (!browserContext) {
