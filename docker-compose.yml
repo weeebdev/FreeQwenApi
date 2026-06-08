@@ -24,6 +24,13 @@ services:
       - uploads_data:/app/uploads
     shm_size: ${SHM_SIZE:-1gb}
     restart: ${RESTART_POLICY:-unless-stopped}
+    networks:
+      - ai-mesh
+
+networks:
+  ai-mesh:
+    name: ai_mesh
+    external: true
 
 volumes:
   session_data:
