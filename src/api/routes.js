@@ -1280,17 +1280,7 @@ router.post('/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
-                if (captureToolCalls) {
-                    const responseContent = result?.choices?.[0]?.message?.content;
-                    const toolCalls = parseToolCallJson(responseContent);
-                    logToolCallOutcome(responseContent, toolCalls);
-                    if (toolCalls && toolCalls.length > 0) {
-                        writeToolCallsSse(res, mappedModel, result, toolCalls);
-                        return;
-                    }
-                }
-
-                // Сохраняем chatId в сессию для следующих запросов
+                // Сохраняем chatId в сессию для следующих запросов (до return, чтобы не пропустить при tool calls)
                 if (!isMeta && result.chatId) {
                     // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
                     if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
@@ -1299,6 +1289,16 @@ router.post('/chat/completions', async (req, res) => {
                     }
                     if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
+                    }
+                }
+
+                if (captureToolCalls) {
+                    const responseContent = result?.choices?.[0]?.message?.content;
+                    const toolCalls = parseToolCallJson(responseContent);
+                    logToolCallOutcome(responseContent, toolCalls);
+                    if (toolCalls && toolCalls.length > 0) {
+                        writeToolCallsSse(res, mappedModel, result, toolCalls);
+                        return;
                     }
                 }
 
@@ -1587,6 +1587,13 @@ router.post('/v1/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
+                // Сохраняем chatId в сессию для следующих запросов (до return, чтобы не пропустить при tool calls)
+                if (!isMeta && result.chatId) {
+                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
+                    }
+                }
+
                 if (captureToolCalls) {
                     const responseContent = result?.choices?.[0]?.message?.content;
                     const toolCalls = parseToolCallJson(responseContent);
@@ -1594,13 +1601,6 @@ router.post('/v1/chat/completions', async (req, res) => {
                     if (toolCalls && toolCalls.length > 0) {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
-                    }
-                }
-
-                // Сохраняем chatId в сессию для следующих запросов
-                if (!isMeta && result.chatId) {
-                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                     }
                 }
 
