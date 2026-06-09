@@ -750,7 +750,27 @@ function logToolCallOutcome(content, toolCalls) {
         return;
     }
     const preview = typeof content === 'string' ? content.slice(0, 180).replace(/\s+/g, ' ') : '';
-    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}..."` : ''}`);
+    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}${content?.length > 180 ? '...' : ''}"` : ''}`);
+    if (typeof content === 'string' && content.length > 0) {
+        logInfo(`[tool-debug] Full Qwen response (${content.length} chars):\n${content}`);
+    }
+}
+
+function logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput) {
+    const toolNames = (combinedTools || [])
+        .map(t => t?.function?.name || t?.name)
+        .filter(Boolean)
+        .join(', ');
+    const mode = preparedInput?.delta ? 'delta' : preparedInput?.folded ? 'folded-transcript' : 'plain';
+    const msgStr = typeof messageContent === 'string'
+        ? messageContent
+        : JSON.stringify(messageContent, null, 2);
+
+    logInfo(`[tool-debug] outgoing — mode=${mode}, tools=[${toolNames}]`);
+    if (toolAwareSystemMessage) {
+        logInfo(`[tool-debug] system prompt (${toolAwareSystemMessage.length} chars):\n${toolAwareSystemMessage}`);
+    }
+    logInfo(`[tool-debug] message to Qwen (${msgStr.length} chars):\n${msgStr}`);
 }
 
 function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
@@ -1314,6 +1334,10 @@ router.post('/chat/completions', async (req, res) => {
                     };
                 }
 
+                if (captureToolCalls) {
+                    logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
+                }
+
                 const result = await sendMessage(
                     messageContent,
                     mappedModel,
@@ -1412,6 +1436,9 @@ router.post('/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
+            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+                logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
+            }
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
 
@@ -1610,13 +1637,17 @@ router.post('/v1/chat/completions', async (req, res) => {
                         });
                     };
                 }
-                
+
+                if (captureToolCalls) {
+                    logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
+                }
+
                 const result = await sendMessage(
                     messageContent,
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ИЗВЛЕКАЕМ FILES
+                    files,
                     qwenTools,
                     tool_choice,
                     toolAwareSystemMessage,
@@ -1702,6 +1733,9 @@ router.post('/v1/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
+            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+                logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
+            }
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
