@@ -514,9 +514,14 @@ function hasOpenAIToolState(messages) {
     );
 }
 
-function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
+function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId, effectiveParentId) {
     const nonSystemMessages = (messages || []).filter(msg => msg && msg.role !== 'system');
     if (nonSystemMessages.length === 0) return false;
+
+    // When we have a live Qwen chat session (chatId + parentId), Qwen's server already
+    // holds all prior context. Folding the full transcript would duplicate that history
+    // and pollute the prompt with past tool failures. Only send the latest delta.
+    if (effectiveChatId && effectiveParentId) return false;
 
     // Hermes/OpenAI agents send the full state every request. After a tool call the
     // next request often ends with role=tool, not role=user. Qwen Chat has no native
@@ -536,15 +541,59 @@ function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
     return false;
 }
 
-function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId) {
+// Extract the latest "delta" to send when Qwen's server already has history:
+// the last user message plus any tool results that immediately precede it
+// (i.e. tool results from the previous assistant tool_calls turn).
+function buildLatestDelta(messages) {
+    const nonSystem = (messages || []).filter(msg => msg && msg.role !== 'system');
+
+    // Collect trailing tool results + the final user message
+    const parts = [];
+    for (let i = nonSystem.length - 1; i >= 0; i--) {
+        const msg = nonSystem[i];
+        if (msg.role === 'user' || msg.role === 'tool' || msg.role === 'function') {
+            parts.unshift(msg);
+        } else {
+            break;
+        }
+    }
+
+    if (parts.length === 0) return null;
+
+    // Format as a compact message Qwen can understand
+    const lines = parts.map(msg => {
+        if (msg.role === 'user') return stringifyOpenAIContent(msg.content);
+        const name = msg.name || msg.tool_call_id || 'tool';
+        return `Tool result (${name}): ${stringifyOpenAIContent(msg.content)}`;
+    }).filter(Boolean);
+
+    return lines.join('\n\n') || null;
+}
+
+function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId) {
     const lastUserMessage = (messages || []).filter(msg => msg && msg.role === 'user').pop();
-    if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId)) {
+
+    if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId, effectiveParentId)) {
         return {
             messageContent: buildStatelessTranscript(messages),
             files: lastUserMessage?.files || [],
             folded: true,
             missingUser: false
         };
+    }
+
+    // Live session — send only the latest delta (last user msg + trailing tool results)
+    if (effectiveChatId && effectiveParentId && hasOpenAIToolState(messages)) {
+        const delta = buildLatestDelta(messages);
+        if (delta) {
+            return {
+                messageContent: delta,
+                files: lastUserMessage?.files || [],
+                folded: false,
+                delta: true,
+                missingUser: false
+            };
+        }
     }
 
     if (!lastUserMessage) {
@@ -1181,7 +1230,7 @@ router.post('/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
 
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId);
         if (preparedInput.missingUser) {
             logError('В запросе нет сообщений от пользователя');
             return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
@@ -1195,19 +1244,19 @@ router.post('/chat/completions', async (req, res) => {
                 if (item.type === 'text') {
                     return { type: 'text', text: item.text };
                 } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
                     return { type: 'image', image: item.image_url.url };
                 } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
                     return { type: 'image', image: item.image };
                 }
                 return item;
             });
         }
         
-        const files = preparedInput.files || []; // ← ИЗВЛЕКАЕМ FILES
+        const files = preparedInput.files || [];
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+        } else if (preparedInput.delta) {
+            logInfo('Live session: sending latest delta only (Qwen server holds prior context)');
         }
 
         if (isMeta) {
@@ -1223,14 +1272,13 @@ router.post('/chat/completions', async (req, res) => {
         logInfo(`Используется модель: ${mappedModel}`);
         if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
 
-        const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+        const qwenTools = null;
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
 
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
 
-        // Логируем полную историю сообщений
         logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
         if (effectiveChatId) {
             logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
@@ -1486,7 +1534,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
 
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId);
         if (preparedInput.missingUser) {
             logError('В запросе нет сообщений от пользователя');
             return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
@@ -1494,25 +1542,24 @@ router.post('/v1/chat/completions', async (req, res) => {
 
         let messageContent = preparedInput.messageContent;
         
-        // Преобразуем OpenAI format content array во внутренний формат
         if (Array.isArray(messageContent)) {
             messageContent = messageContent.map(item => {
                 if (item.type === 'text') {
                     return { type: 'text', text: item.text };
                 } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
                     return { type: 'image', image: item.image_url.url };
                 } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
                     return { type: 'image', image: item.image };
                 }
                 return item;
             });
         }
         
-        const files = preparedInput.files || []; // ← ИЗВЛЕКАЕМ FILES
+        const files = preparedInput.files || [];
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+        } else if (preparedInput.delta) {
+            logInfo('Live session: sending latest delta only (Qwen server holds prior context)');
         }
 
         if (isMeta) {
@@ -1531,13 +1578,12 @@ router.post('/v1/chat/completions', async (req, res) => {
             logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
         }
 
-        const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+        const qwenTools = null;
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
 
-        // Логируем полную историю сообщений
         logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
         if (effectiveChatId) {
             logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
