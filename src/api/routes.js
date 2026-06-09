@@ -161,10 +161,6 @@ function isStaleChatErrorText(text) {
     return lower.includes('not exist') && (lower.includes('chat') || lower.includes('invalid input'));
 }
 
-function looksLikeToolHallucination(content) {
-    return typeof content === 'string' && /Tool [\w.-]+ does not exists?/i.test(content);
-}
-
 function isAgentToolRequest(combinedTools, messages) {
     if (isContextSynthesisRequest(messages)) return false;
     if (Array.isArray(combinedTools) && combinedTools.length > 0) return true;
@@ -745,8 +741,13 @@ function logToolCallOutcome(content, toolCalls) {
         logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
         return;
     }
-    const preview = typeof content === 'string' ? content.slice(0, 120).replace(/\s+/g, ' ') : '';
-    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}..."` : ''}`);
+    // Hermes always sends tools[] even when expecting a final prose answer after tool results.
+    const trimmed = typeof content === 'string' ? content.trim() : '';
+    if (trimmed.startsWith('{') && /tool_calls/i.test(trimmed)) {
+        logWarn(`Malformed tool_calls JSON from Qwen: ${trimmed.slice(0, 120)}...`);
+    } else if (trimmed) {
+        logDebug(`Tool mode: Qwen replied in prose (${trimmed.length} chars)`);
+    }
 }
 
 function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
@@ -1360,19 +1361,6 @@ router.post('/chat/completions', async (req, res) => {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
-                    if (looksLikeToolHallucination(responseContent)) {
-                        logWarn('Qwen returned tool error hallucination — suppressing invalid assistant prose');
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                        return;
-                    }
                     if (responseContent) {
                         writeSse({
                             id: 'chatcmpl-stream',
@@ -1456,11 +1444,6 @@ router.post('/chat/completions', async (req, res) => {
                 logToolCallOutcome(responseContent, toolCalls);
                 if (toolCalls?.length) {
                     return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                }
-                if (looksLikeToolHallucination(responseContent)) {
-                    return res.status(502).json({
-                        error: { message: 'Qwen returned invalid tool response text', type: 'server_error' }
-                    });
                 }
             }
 
@@ -1682,19 +1665,6 @@ router.post('/v1/chat/completions', async (req, res) => {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
-                    if (looksLikeToolHallucination(responseContent)) {
-                        logWarn('Qwen returned tool error hallucination — suppressing invalid assistant prose');
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                        return;
-                    }
                     if (responseContent) {
                         writeSse({
                             id: 'chatcmpl-stream',
@@ -1780,11 +1750,6 @@ router.post('/v1/chat/completions', async (req, res) => {
                 logToolCallOutcome(messageText, toolCalls);
                 if (toolCalls?.length) {
                     return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                }
-                if (looksLikeToolHallucination(messageText)) {
-                    return res.status(502).json({
-                        error: { message: 'Qwen returned invalid tool response text', type: 'server_error' }
-                    });
                 }
             }
 
