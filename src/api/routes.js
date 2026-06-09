@@ -12,7 +12,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats } from './tokenManager.js';
+import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats, assignChatAccount } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 
 // Функция для генерирования детерминированного chatId на основе истории
@@ -101,7 +101,9 @@ function extractConversationHint(req) {
         req.get?.('x-conversation-id'),
         req.get?.('x-openwebui-conversation-id'),
         req.get?.('x-chat-id'),
-        req.get?.('x-openwebui-chat-id')
+        req.get?.('x-openwebui-chat-id'),
+        req.get?.('x-hermes-session-id'),
+        req.get?.('x-session-id')
     ]);
 }
 
@@ -147,6 +149,104 @@ function shouldPersistSessionContext(scope = null) {
     return Boolean(normalizedScope) || ALLOW_UNSCOPED_SESSION_CHAT_RESTORE;
 }
 
+function isContextSynthesisRequest(messages) {
+    const systemMsg = (messages || []).find(msg => msg?.role === 'system');
+    const text = typeof systemMsg?.content === 'string' ? systemMsg.content : '';
+    return /context synthesis/i.test(text);
+}
+
+function isAgentToolRequest(combinedTools, messages) {
+    if (isContextSynthesisRequest(messages)) return false;
+    if (Array.isArray(combinedTools) && combinedTools.length > 0) return true;
+    return hasOpenAIToolState(messages);
+}
+
+function resolveOpenAIChatSession(req, {
+    explicitChatId,
+    explicitParentId,
+    conversationHint,
+    forceNewChat,
+    isMeta,
+    messages,
+    combinedTools
+}) {
+    const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
+    const agentRequest = isAgentToolRequest(combinedTools, messages);
+    const agentScope = agentRequest ? `agent:${getSessionKey(req)}` : null;
+    const sessionScope = conversationScope || agentScope;
+
+    let effectiveChatId = explicitChatId;
+    let effectiveParentId = explicitParentId;
+
+    if (forceNewChat && !explicitChatId && !isMeta) {
+        effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
+        effectiveParentId = null;
+        logInfo(`Принудительно запрошен новый чат (newChat/resetChat): ${effectiveChatId}`);
+    }
+
+    if (!effectiveChatId && !isMeta) {
+        if (conversationHint) {
+            const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
+            if (scopedSession?.chatId) {
+                effectiveChatId = scopedSession.chatId;
+                if (!effectiveParentId && scopedSession.parentId) {
+                    effectiveParentId = scopedSession.parentId;
+                }
+                logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
+            } else {
+                effectiveChatId = buildInternalChatIdFromHint(conversationHint);
+                logInfo(`Using client conversation-id key: ${effectiveChatId}`);
+            }
+        } else if (agentRequest) {
+            const savedSession = forceNewChat ? null : getSavedChatId(req, sessionScope);
+            if (savedSession?.chatId) {
+                effectiveChatId = savedSession.chatId;
+                if (!effectiveParentId && savedSession.parentId) {
+                    effectiveParentId = savedSession.parentId;
+                }
+                logInfo(`Restored agent tool session chatId: ${effectiveChatId}`);
+            } else {
+                effectiveChatId = generateChatIdFromHistory(messages);
+                if (effectiveChatId) {
+                    logInfo(`Created agent tool session key: ${effectiveChatId}`);
+                }
+            }
+        } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
+            const savedSession = forceNewChat ? null : getSavedChatId(req);
+            if (savedSession?.chatId) {
+                effectiveChatId = savedSession.chatId;
+                if (!effectiveParentId && savedSession.parentId) {
+                    effectiveParentId = savedSession.parentId;
+                }
+                logInfo(`Restored chatId from session: ${effectiveChatId}`);
+            }
+
+            if (!effectiveChatId) {
+                const generatedId = generateChatIdFromHistory(messages);
+                if (generatedId) {
+                    effectiveChatId = generatedId;
+                    logInfo(`Created new chatId for session: ${effectiveChatId}`);
+                }
+            }
+        } else {
+            logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
+        }
+    }
+
+    return {
+        effectiveChatId,
+        effectiveParentId,
+        sessionScope,
+        agentRequest
+    };
+}
+
+function shouldPersistOpenAISession(sessionScope, agentRequest) {
+    if (sessionScope) return true;
+    if (agentRequest) return true;
+    return ALLOW_UNSCOPED_SESSION_CHAT_RESTORE;
+}
+
 // Глобальное хранилище для маппинга между сгенерированными ID и реальными Qwen chatId
 const chatIdMap = new Map();
 
@@ -171,13 +271,16 @@ async function resolveQwenChatId(effectiveChatId, mappedModel) {
         return qwenChatId;
     }
 
-    if (effectiveChatId && effectiveChatId.startsWith('chat_')) {
+    if (effectiveChatId?.startsWith('chat_')) {
         try {
-            const created = await createChatV2(mappedModel, 'Сессия OpenWebUI');
-            if (created && created.chatId) {
+            const created = await createChatV2(mappedModel, 'Agent session');
+            if (created?.chatId) {
                 mapChatId(effectiveChatId, created.chatId);
                 qwenChatId = created.chatId;
-                logInfo(`🔨 Создан Qwen chat ${qwenChatId} и привязан к ${effectiveChatId}`);
+                if (created.accountId) {
+                    assignChatAccount(created.chatId, created.accountId);
+                }
+                logInfo(`🔨 Создан Qwen chat ${qwenChatId} и привязан к ${effectiveChatId} (account=${created.accountId || 'unknown'})`);
             }
         } catch (error) {
             logDebug(`Не удалось создать Qwen chat для ${effectiveChatId}: ${error.message}`);
@@ -586,6 +689,15 @@ function parseToolCallJson(content) {
 function applyToolPrompt(systemMessage, tools) {
     const prompt = toolsToPrompt(tools);
     return prompt ? `${systemMessage || ''}${prompt}`.trim() : systemMessage;
+}
+
+function logToolCallOutcome(content, toolCalls) {
+    if (toolCalls?.length) {
+        logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
+        return;
+    }
+    const preview = typeof content === 'string' ? content.slice(0, 180).replace(/\s+/g, ' ') : '';
+    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}..."` : ''}`);
 }
 
 function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
@@ -1028,7 +1140,6 @@ router.post('/chat/completions', async (req, res) => {
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
         const explicitParentId = extractParentHint(req);
         const conversationHint = extractConversationHint(req);
-        const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
         const forceNewChat = shouldForceNewChat(req);
         logInfo(`Получен OpenAI-совместимый запрос${stream ? ' (stream)' : ''}`);
 
@@ -1038,56 +1149,27 @@ router.post('/chat/completions', async (req, res) => {
         }
 
         const isMeta = isOpenWebUiMetaRequest(messages);
-
-        // Используем переданный chatId ИЛИ восстанавливаем из сессии
-        let effectiveChatId = explicitChatId;
-        let effectiveParentId = explicitParentId;
-
-        if (forceNewChat && !explicitChatId && !isMeta) {
-            effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
-            effectiveParentId = null;
-            logInfo(`Принудительно запрошен новый чат (newChat/resetChat): ${effectiveChatId}`);
-        }
-
-        if (!effectiveChatId && !isMeta) {
-            if (conversationHint) {
-                const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
-                if (scopedSession?.chatId) {
-                    effectiveChatId = scopedSession.chatId;
-                    if (!effectiveParentId && scopedSession.parentId) {
-                        effectiveParentId = scopedSession.parentId;
-                    }
-                    logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
-                } else {
-                    effectiveChatId = buildInternalChatIdFromHint(conversationHint);
-                    logInfo(`Using client conversation-id key: ${effectiveChatId}`);
-                }
-            } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
-                    }
-                }
-            } else {
-                logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
-            }
-        }
+        const { combinedTools, toolChoice } = buildCombinedTools(tools, functions, tool_choice);
+        const {
+            effectiveChatId: resolvedChatId,
+            effectiveParentId: resolvedParentId,
+            sessionScope,
+            agentRequest
+        } = resolveOpenAIChatSession(req, {
+            explicitChatId,
+            explicitParentId,
+            conversationHint,
+            forceNewChat,
+            isMeta,
+            messages,
+            combinedTools
+        });
+        let effectiveChatId = resolvedChatId;
+        let effectiveParentId = resolvedParentId;
 
         // Извлекаем system message если есть
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
-        const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
@@ -1143,6 +1225,9 @@ router.post('/chat/completions', async (req, res) => {
         if (effectiveChatId) {
             logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
         }
+        if (agentRequest) {
+            logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
+        }
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1196,7 +1281,9 @@ router.post('/chat/completions', async (req, res) => {
                 );
 
                 if (captureToolCalls) {
-                    const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
+                    const responseContent = result?.choices?.[0]?.message?.content;
+                    const toolCalls = parseToolCallJson(responseContent);
+                    logToolCallOutcome(responseContent, toolCalls);
                     if (toolCalls && toolCalls.length > 0) {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
@@ -1210,8 +1297,8 @@ router.post('/chat/completions', async (req, res) => {
                         mapChatId(effectiveChatId, result.chatId);
                         logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
                     }
-                    if (shouldPersistSessionContext(conversationScope)) {
-                        saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                     }
                 }
 
@@ -1283,8 +1370,8 @@ router.post('/chat/completions', async (req, res) => {
                     mapChatId(effectiveChatId, result.chatId);
                     logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
                 }
-                if (shouldPersistSessionContext(conversationScope)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                 }
             }
 
@@ -1294,7 +1381,11 @@ router.post('/chat/completions', async (req, res) => {
                 });
             }
 
-            const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
+            const responseContent = result?.choices?.[0]?.message?.content;
+            const toolCalls = parseToolCallJson(responseContent);
+            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+                logToolCallOutcome(responseContent, toolCalls);
+            }
             if (toolCalls && toolCalls.length > 0) {
                 return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
             }
@@ -1352,7 +1443,6 @@ router.post('/v1/chat/completions', async (req, res) => {
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
         const explicitParentId = extractParentHint(req);
         const conversationHint = extractConversationHint(req);
-        const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
         const forceNewChat = shouldForceNewChat(req);
 
         logInfo(`Получен OpenAI v1 запрос${stream ? ' (stream)' : ''}`);
@@ -1363,56 +1453,27 @@ router.post('/v1/chat/completions', async (req, res) => {
         }
 
         const isMeta = isOpenWebUiMetaRequest(messages);
-
-        // Используем переданный chatId ИЛИ восстанавливаем из сессии
-        let effectiveChatId = explicitChatId;
-        let effectiveParentId = explicitParentId;
-
-        if (forceNewChat && !explicitChatId && !isMeta) {
-            effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
-            effectiveParentId = null;
-            logInfo(`Принудительно запрошен новый чат (newChat/resetChat): ${effectiveChatId}`);
-        }
-
-        if (!effectiveChatId && !isMeta) {
-            if (conversationHint) {
-                const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
-                if (scopedSession?.chatId) {
-                    effectiveChatId = scopedSession.chatId;
-                    if (!effectiveParentId && scopedSession.parentId) {
-                        effectiveParentId = scopedSession.parentId;
-                    }
-                    logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
-                } else {
-                    effectiveChatId = buildInternalChatIdFromHint(conversationHint);
-                    logInfo(`Using client conversation-id key: ${effectiveChatId}`);
-                }
-            } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
-                    }
-                }
-            } else {
-                logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
-            }
-        }
+        const { combinedTools, toolChoice } = buildCombinedTools(tools, functions, tool_choice);
+        const {
+            effectiveChatId: resolvedChatId,
+            effectiveParentId: resolvedParentId,
+            sessionScope,
+            agentRequest
+        } = resolveOpenAIChatSession(req, {
+            explicitChatId,
+            explicitParentId,
+            conversationHint,
+            forceNewChat,
+            isMeta,
+            messages,
+            combinedTools
+        });
+        let effectiveChatId = resolvedChatId;
+        let effectiveParentId = resolvedParentId;
 
         // Извлекаем system message если есть
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
-        const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
@@ -1470,6 +1531,9 @@ router.post('/v1/chat/completions', async (req, res) => {
         if (effectiveChatId) {
             logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
         }
+        if (agentRequest) {
+            logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
+        }
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1524,7 +1588,9 @@ router.post('/v1/chat/completions', async (req, res) => {
                 );
 
                 if (captureToolCalls) {
-                    const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
+                    const responseContent = result?.choices?.[0]?.message?.content;
+                    const toolCalls = parseToolCallJson(responseContent);
+                    logToolCallOutcome(responseContent, toolCalls);
                     if (toolCalls && toolCalls.length > 0) {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
@@ -1533,8 +1599,8 @@ router.post('/v1/chat/completions', async (req, res) => {
 
                 // Сохраняем chatId в сессию для следующих запросов
                 if (!isMeta && result.chatId) {
-                    if (shouldPersistSessionContext(conversationScope)) {
-                        saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                     }
                 }
 
@@ -1608,8 +1674,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     mapChatId(effectiveChatId, result.chatId);
                     logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
                 }
-                if (shouldPersistSessionContext(conversationScope)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                 }
             }
 
@@ -1628,6 +1694,9 @@ router.post('/v1/chat/completions', async (req, res) => {
             }
 
             const toolCalls = parseToolCallJson(messageText);
+            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+                logToolCallOutcome(messageText, toolCalls);
+            }
             if (toolCalls && toolCalls.length > 0) {
                 return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
             }
@@ -1660,8 +1729,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                 // Сохраняем chatId в сессии для последующих запросов от этого клиента
                 if (!isMeta) {
                     try {
-                        if (shouldPersistSessionContext(conversationScope)) {
-                            saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, conversationScope);
+                        if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                            saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, sessionScope);
                         }
                     } catch (e) {
                         logDebug(`Не удалось сохранить chatId в сессии: ${e.message}`);
