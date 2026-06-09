@@ -724,6 +724,16 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         return { error: 'Требуется верификация. Браузер запущен в видимом режиме.', verification: true, chatId };
     }
 
+    if (response.errorBody && response.errorBody.includes('chat is in progress')) {
+        const waitMs = 3000 + retryCount * 2000;
+        logWarn(`Qwen: чат занят — повтор через ${waitMs}мс (попытка ${retryCount + 1}/${MAX_RETRY_COUNT})`);
+        if (retryCount < MAX_RETRY_COUNT) {
+            await delay(waitMs);
+            return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+        }
+        return { error: 'Qwen chat занят, превышено число попыток', chatId };
+    }
+
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
         logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
         authToken = null;
