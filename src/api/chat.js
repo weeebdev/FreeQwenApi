@@ -555,7 +555,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 }
 
 async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
-    if (payload?.stream !== false && typeof onChunk === 'function') {
+    // Always prefer node streaming for SSE responses — it reliably captures response_id.
+    // When onChunk is null (e.g. captureToolCalls mode) chunks are simply not forwarded
+    // to the caller, but response assembly and responseId extraction still work correctly.
+    if (payload?.stream !== false) {
         const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
 
         const canReturnDirectly =
@@ -667,6 +670,8 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                             }
 
                             if (chunk['response.created']) responseId = chunk['response.created'].response_id;
+                            if (chunk.response_id) responseId = chunk.response_id;
+                            if (!responseId && chunk.id && chunk.id !== 'chatcmpl-') responseId = chunk.id;
                             if (chunk.choices && chunk.choices[0]) {
                                 const delta = chunk.choices[0].delta;
                                 if (delta && delta.content) fullContent += delta.content;

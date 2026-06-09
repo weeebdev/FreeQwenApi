@@ -199,13 +199,17 @@ function resolveOpenAIChatSession(req, {
             }
         } else if (agentRequest) {
             const savedSession = forceNewChat ? null : getSavedChatId(req, sessionScope);
-            if (savedSession?.chatId) {
+            // Discard sessions where parentId was never captured (null) — posting to an
+            // existing Qwen chat without a parentId causes immediate API rejection.
+            const sessionValid = savedSession?.chatId && savedSession?.parentId;
+            if (sessionValid) {
                 effectiveChatId = savedSession.chatId;
-                if (!effectiveParentId && savedSession.parentId) {
-                    effectiveParentId = savedSession.parentId;
-                }
-                logInfo(`Restored agent tool session chatId: ${effectiveChatId}`);
+                effectiveParentId = savedSession.parentId;
+                logInfo(`Restored agent tool session chatId: ${effectiveChatId}, parentId: ${effectiveParentId}`);
             } else {
+                if (savedSession?.chatId && !savedSession?.parentId) {
+                    logWarn(`Discarding stale agent session (parentId null) for scope ${sessionScope}, creating fresh chat`);
+                }
                 effectiveChatId = generateChatIdFromHistory(messages);
                 if (effectiveChatId) {
                     logInfo(`Created agent tool session key: ${effectiveChatId}`);
