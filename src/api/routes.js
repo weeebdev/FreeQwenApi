@@ -12,7 +12,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats, assignChatAccount } from './tokenManager.js';
+import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats, assignChatAccount, releaseChatAccount } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 
 // Функция для генерирования детерминированного chatId на основе истории
@@ -148,6 +148,21 @@ function isContextSynthesisRequest(messages) {
     const systemMsg = (messages || []).find(msg => msg?.role === 'system');
     const text = typeof systemMsg?.content === 'string' ? systemMsg.content : '';
     return /context synthesis/i.test(text);
+}
+
+function shouldCaptureToolCalls(messages, combinedTools, isMeta) {
+    if (isMeta || isContextSynthesisRequest(messages)) return false;
+    return Array.isArray(combinedTools) && combinedTools.length > 0;
+}
+
+function isStaleChatErrorText(text) {
+    if (!text || typeof text !== 'string') return false;
+    const lower = text.toLowerCase();
+    return lower.includes('not exist') && (lower.includes('chat') || lower.includes('invalid input'));
+}
+
+function looksLikeToolHallucination(content) {
+    return typeof content === 'string' && /Tool [\w.-]+ does not exists?/i.test(content);
 }
 
 function isAgentToolRequest(combinedTools, messages) {
@@ -363,6 +378,19 @@ function saveChatIdForSession(req, chatId, parentId, scope = null) {
     const scopeSuffix = normalizedScope ? ` (scope=${normalizedScope})` : "";
     logDebug(`Saved chatId ${chatId} for session ${sessionKey.substring(0, 8)}${scopeSuffix}`);
 }
+
+function purgeStaleChatBindings(req, sessionScope, qwenChatId, internalChatId) {
+    if (qwenChatId) releaseChatAccount(qwenChatId);
+    if (internalChatId) {
+        chatIdMap.delete(internalChatId);
+        for (const [key, value] of chatIdMap.entries()) {
+            if (value === qwenChatId) chatIdMap.delete(key);
+        }
+    }
+    if (sessionScope) {
+        sessionToChatMap.delete(getScopedSessionKey(req, sessionScope));
+    }
+}
 // Очистка старых сессий каждые 10 минут
 setInterval(() => {
     const now = Date.now();
@@ -509,6 +537,8 @@ function hasOpenAIToolState(messages) {
 }
 
 function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
+    if (isContextSynthesisRequest(messages)) return false;
+
     const nonSystemMessages = (messages || []).filter(msg => msg && msg.role !== 'system');
     if (nonSystemMessages.length === 0) return false;
 
@@ -533,6 +563,18 @@ function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
 
 function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId) {
     const lastUserMessage = (messages || []).filter(msg => msg && msg.role === 'user').pop();
+
+    if (isContextSynthesisRequest(messages)) {
+        if (!lastUserMessage) {
+            return { messageContent: null, files: [], folded: false, missingUser: true };
+        }
+        return {
+            messageContent: lastUserMessage.content,
+            files: lastUserMessage.files || [],
+            folded: false,
+            missingUser: false
+        };
+    }
 
     if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId)) {
         return {
@@ -692,7 +734,8 @@ function parseToolCallJson(content) {
     return null;
 }
 
-function applyToolPrompt(systemMessage, tools) {
+function applyToolPrompt(systemMessage, tools, messages) {
+    if (isContextSynthesisRequest(messages)) return systemMessage;
     const prompt = toolsToPrompt(tools);
     return prompt ? `${systemMessage || ''}${prompt}`.trim() : systemMessage;
 }
@@ -702,28 +745,8 @@ function logToolCallOutcome(content, toolCalls) {
         logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
         return;
     }
-    const preview = typeof content === 'string' ? content.slice(0, 180).replace(/\s+/g, ' ') : '';
-    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}${content?.length > 180 ? '...' : ''}"` : ''}`);
-    if (typeof content === 'string' && content.length > 0) {
-        logInfo(`[tool-debug] Full Qwen response (${content.length} chars):\n${content}`);
-    }
-}
-
-function logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput) {
-    const toolNames = (combinedTools || [])
-        .map(t => t?.function?.name || t?.name)
-        .filter(Boolean)
-        .join(', ');
-    const mode = preparedInput?.folded ? 'folded-transcript' : 'plain';
-    const msgStr = typeof messageContent === 'string'
-        ? messageContent
-        : JSON.stringify(messageContent, null, 2);
-
-    logInfo(`[tool-debug] outgoing — mode=${mode}, tools=[${toolNames}]`);
-    if (toolAwareSystemMessage) {
-        logInfo(`[tool-debug] system prompt (${toolAwareSystemMessage.length} chars):\n${toolAwareSystemMessage}`);
-    }
-    logInfo(`[tool-debug] message to Qwen (${msgStr.length} chars):\n${msgStr}`);
+    const preview = typeof content === 'string' ? content.slice(0, 120).replace(/\s+/g, ' ') : '';
+    logWarn(`Tool response expected but no tool_calls JSON parsed${preview ? `: "${preview}..."` : ''}`);
 }
 
 function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
@@ -1237,7 +1260,7 @@ router.post('/chat/completions', async (req, res) => {
         logInfo(`Используется модель: ${mappedModel}`);
 
         const qwenTools = null;
-        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
+        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools, messages);
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
@@ -1249,6 +1272,8 @@ router.post('/chat/completions', async (req, res) => {
         if (agentRequest) {
             logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
         }
+
+        const captureToolCalls = shouldCaptureToolCalls(messages, combinedTools, isMeta);
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1269,7 +1294,6 @@ router.post('/chat/completions', async (req, res) => {
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
-                const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
@@ -1283,10 +1307,6 @@ router.post('/chat/completions', async (req, res) => {
                             ]
                         });
                     };
-                }
-
-                if (captureToolCalls) {
-                    logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
                 }
 
                 const result = await sendMessage(
@@ -1305,6 +1325,10 @@ router.post('/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
+                if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
+                    purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
+                }
+
                 // Сохраняем chatId в сессию — только при успехе и непустом parentId,
                 // чтобы не перезаписать валидный parentId результатом ошибки.
                 if (!isMeta && result.chatId && !result.error && result.parentId) {
@@ -1318,16 +1342,6 @@ router.post('/chat/completions', async (req, res) => {
                     }
                 }
 
-                if (captureToolCalls) {
-                    const responseContent = result?.choices?.[0]?.message?.content;
-                    const toolCalls = parseToolCallJson(responseContent);
-                    logToolCallOutcome(responseContent, toolCalls);
-                    if (toolCalls && toolCalls.length > 0) {
-                        writeToolCallsSse(res, mappedModel, result, toolCalls);
-                        return;
-                    }
-                }
-
                 if (result.error) {
                     writeSse({
                         id: 'chatcmpl-stream',
@@ -1338,6 +1352,36 @@ router.post('/chat/completions', async (req, res) => {
                             { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: null }
                         ]
                     });
+                } else if (captureToolCalls) {
+                    const responseContent = result?.choices?.[0]?.message?.content;
+                    const toolCalls = parseToolCallJson(responseContent);
+                    logToolCallOutcome(responseContent, toolCalls);
+                    if (toolCalls?.length) {
+                        writeToolCallsSse(res, mappedModel, result, toolCalls);
+                        return;
+                    }
+                    if (looksLikeToolHallucination(responseContent)) {
+                        logWarn('Qwen returned tool error hallucination — suppressing invalid assistant prose');
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || 'qwen-max-latest',
+                            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                        });
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                        return;
+                    }
+                    if (responseContent) {
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || 'qwen-max-latest',
+                            choices: [{ index: 0, delta: { content: responseContent }, finish_reason: null }]
+                        });
+                    }
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                     // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
                     const content = result.choices[0].message.content;
@@ -1387,11 +1431,12 @@ router.post('/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
-            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
-                logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
-            }
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
+
+            if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
+                purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
+            }
 
             if (result.error) {
                 return res.status(500).json({
@@ -1405,13 +1450,18 @@ router.post('/chat/completions', async (req, res) => {
                 }
             }
 
-            const responseContent = result?.choices?.[0]?.message?.content;
-            const toolCalls = parseToolCallJson(responseContent);
-            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+            if (captureToolCalls) {
+                const responseContent = result?.choices?.[0]?.message?.content;
+                const toolCalls = parseToolCallJson(responseContent);
                 logToolCallOutcome(responseContent, toolCalls);
-            }
-            if (toolCalls && toolCalls.length > 0) {
-                return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
+                if (toolCalls?.length) {
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
+                }
+                if (looksLikeToolHallucination(responseContent)) {
+                    return res.status(502).json({
+                        error: { message: 'Qwen returned invalid tool response text', type: 'server_error' }
+                    });
+                }
             }
 
             const openaiResponse = {
@@ -1538,7 +1588,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         logInfo(`Используется модель: ${mappedModel}`);
 
         const qwenTools = null;
-        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
+        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools, messages);
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
@@ -1550,6 +1600,8 @@ router.post('/v1/chat/completions', async (req, res) => {
         if (agentRequest) {
             logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
         }
+
+        const captureToolCalls = shouldCaptureToolCalls(messages, combinedTools, isMeta);
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1570,7 +1622,6 @@ router.post('/v1/chat/completions', async (req, res) => {
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
-                const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
@@ -1585,10 +1636,6 @@ router.post('/v1/chat/completions', async (req, res) => {
                             ]
                         });
                     };
-                }
-
-                if (captureToolCalls) {
-                    logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
                 }
 
                 const result = await sendMessage(
@@ -1607,19 +1654,13 @@ router.post('/v1/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
+                if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
+                    purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
+                }
+
                 if (!isMeta && result.chatId && !result.error && result.parentId) {
                     if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                    }
-                }
-
-                if (captureToolCalls) {
-                    const responseContent = result?.choices?.[0]?.message?.content;
-                    const toolCalls = parseToolCallJson(responseContent);
-                    logToolCallOutcome(responseContent, toolCalls);
-                    if (toolCalls && toolCalls.length > 0) {
-                        writeToolCallsSse(res, mappedModel, result, toolCalls);
-                        return;
                     }
                 }
 
@@ -1633,6 +1674,36 @@ router.post('/v1/chat/completions', async (req, res) => {
                             { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: 'stop' }
                         ]
                     });
+                } else if (captureToolCalls) {
+                    const responseContent = result?.choices?.[0]?.message?.content;
+                    const toolCalls = parseToolCallJson(responseContent);
+                    logToolCallOutcome(responseContent, toolCalls);
+                    if (toolCalls?.length) {
+                        writeToolCallsSse(res, mappedModel, result, toolCalls);
+                        return;
+                    }
+                    if (looksLikeToolHallucination(responseContent)) {
+                        logWarn('Qwen returned tool error hallucination — suppressing invalid assistant prose');
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || 'qwen-max-latest',
+                            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                        });
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                        return;
+                    }
+                    if (responseContent) {
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || 'qwen-max-latest',
+                            choices: [{ index: 0, delta: { content: responseContent }, finish_reason: null }]
+                        });
+                    }
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                     // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
                     const content = result.choices[0].message.content;
@@ -1682,12 +1753,13 @@ router.post('/v1/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
-            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
-                logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTools, preparedInput);
-            }
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
+
+            if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
+                purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
+            }
 
             if (result.error) {
                 return res.status(500).json({
@@ -1703,12 +1775,17 @@ router.post('/v1/chat/completions', async (req, res) => {
                 messageText = result.response.text;
             }
 
-            const toolCalls = parseToolCallJson(messageText);
-            if (Array.isArray(combinedTools) && combinedTools.length > 0) {
+            if (captureToolCalls) {
+                const toolCalls = parseToolCallJson(messageText);
                 logToolCallOutcome(messageText, toolCalls);
-            }
-            if (toolCalls && toolCalls.length > 0) {
-                return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
+                if (toolCalls?.length) {
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
+                }
+                if (looksLikeToolHallucination(messageText)) {
+                    return res.status(502).json({
+                        error: { message: 'Qwen returned invalid tool response text', type: 'server_error' }
+                    });
+                }
             }
 
             if (!isMeta && result.chatId && result.parentId) {

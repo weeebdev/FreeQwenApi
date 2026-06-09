@@ -710,6 +710,12 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     }, requestBody);
 }
 
+function isStaleChatError(errorBody) {
+    if (!errorBody || typeof errorBody !== 'string') return false;
+    const lower = errorBody.toLowerCase();
+    return lower.includes('not exist') && (lower.includes('chat') || lower.includes('invalid input'));
+}
+
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, tools = null, toolChoice = null, systemMessage = null) {
     logRaw(JSON.stringify(response));
     logError(`Ошибка при получении ответа: ${response.error || response.statusText || `HTTP ${response.status || 'unknown'}`}`);
@@ -779,6 +785,23 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
+    }
+
+    if (isStaleChatError(response.errorBody)) {
+        logWarn(`Qwen: чат ${chatId} не существует — повтор с новым чатом`);
+        if (chatId) {
+            const { releaseChatAccount } = await import('./tokenManager.js');
+            releaseChatAccount(chatId);
+        }
+        if (retryCount < MAX_RETRY_COUNT) {
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+        }
+        return {
+            error: 'Qwen chat не существует, превышено число попыток',
+            details: response.errorBody,
+            chatId,
+            staleChat: true
+        };
     }
 
     return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
