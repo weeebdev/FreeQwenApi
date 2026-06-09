@@ -12,7 +12,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats, assignChatAccount, releaseChatAccount } from './tokenManager.js';
+import { listTokens, markInvalid, markRateLimited, markValid, getAccountUsageStats, assignChatAccount } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 
 // Функция для генерирования детерминированного chatId на основе истории
@@ -144,27 +144,13 @@ function shouldForceNewChat(req) {
     ].some(isTruthyFlag);
 }
 
-function isContextSynthesisRequest(messages) {
-    const systemMsg = (messages || []).find(msg => msg?.role === 'system');
-    const text = typeof systemMsg?.content === 'string' ? systemMsg.content : '';
-    return /context synthesis/i.test(text);
-}
-
-function shouldCaptureToolCalls(messages, combinedTools, isMeta) {
-    if (isMeta || isContextSynthesisRequest(messages)) return false;
-    return Array.isArray(combinedTools) && combinedTools.length > 0;
-}
-
-function isStaleChatErrorText(text) {
-    if (!text || typeof text !== 'string') return false;
-    const lower = text.toLowerCase();
-    return lower.includes('not exist') && (lower.includes('chat') || lower.includes('invalid input'));
-}
-
 function isAgentToolRequest(combinedTools, messages) {
-    if (isContextSynthesisRequest(messages)) return false;
     if (Array.isArray(combinedTools) && combinedTools.length > 0) return true;
     return hasOpenAIToolState(messages);
+}
+
+function hasHermesTools(combinedTools, isMeta) {
+    return !isMeta && Array.isArray(combinedTools) && combinedTools.length > 0;
 }
 
 function resolveOpenAIChatSession(req, {
@@ -375,18 +361,6 @@ function saveChatIdForSession(req, chatId, parentId, scope = null) {
     logDebug(`Saved chatId ${chatId} for session ${sessionKey.substring(0, 8)}${scopeSuffix}`);
 }
 
-function purgeStaleChatBindings(req, sessionScope, qwenChatId, internalChatId) {
-    if (qwenChatId) releaseChatAccount(qwenChatId);
-    if (internalChatId) {
-        chatIdMap.delete(internalChatId);
-        for (const [key, value] of chatIdMap.entries()) {
-            if (value === qwenChatId) chatIdMap.delete(key);
-        }
-    }
-    if (sessionScope) {
-        sessionToChatMap.delete(getScopedSessionKey(req, sessionScope));
-    }
-}
 // Очистка старых сессий каждые 10 минут
 setInterval(() => {
     const now = Date.now();
@@ -533,16 +507,10 @@ function hasOpenAIToolState(messages) {
 }
 
 function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
-    if (isContextSynthesisRequest(messages)) return false;
-
     const nonSystemMessages = (messages || []).filter(msg => msg && msg.role !== 'system');
     if (nonSystemMessages.length === 0) return false;
 
-    // Tool-calling conversations MUST fold the full transcript on EVERY turn.
-    // Qwen Chat's web memory does not preserve OpenAI tool-call discipline across turns,
-    // so relying on the live session (sending only the latest delta) makes Qwen "forget"
-    // it should emit tool_calls JSON and reply in prose. Folding keeps the whole OpenAI
-    // transcript — including the tool-call format — visible to Qwen each turn.
+    // Hermes tool-result turns (`role: "tool"`) must keep the full OpenAI transcript.
     if (hasOpenAIToolState(messages)) return true;
 
     // If FreeQwenApi is used as a stateless OpenAI-compatible endpoint and no
@@ -559,18 +527,6 @@ function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
 
 function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId) {
     const lastUserMessage = (messages || []).filter(msg => msg && msg.role === 'user').pop();
-
-    if (isContextSynthesisRequest(messages)) {
-        if (!lastUserMessage) {
-            return { messageContent: null, files: [], folded: false, missingUser: true };
-        }
-        return {
-            messageContent: lastUserMessage.content,
-            files: lastUserMessage.files || [],
-            folded: false,
-            missingUser: false
-        };
-    }
 
     if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId)) {
         return {
@@ -730,23 +686,38 @@ function parseToolCallJson(content) {
     return null;
 }
 
-function applyToolPrompt(systemMessage, tools, messages) {
-    if (isContextSynthesisRequest(messages)) return systemMessage;
+function applyToolPrompt(systemMessage, tools) {
     const prompt = toolsToPrompt(tools);
     return prompt ? `${systemMessage || ''}${prompt}`.trim() : systemMessage;
 }
 
-function logToolCallOutcome(content, toolCalls) {
-    if (toolCalls?.length) {
-        logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
-        return;
+function normalizeOpenAIMessageContent(messageContent) {
+    if (!Array.isArray(messageContent)) return messageContent;
+    return messageContent.map(item => {
+        if (item.type === 'text') return { type: 'text', text: item.text };
+        if (item.type === 'image_url' && item.image_url) return { type: 'image', image: item.image_url.url };
+        if (item.type === 'image') return { type: 'image', image: item.image };
+        return item;
+    });
+}
+
+function extractAssistantContent(result) {
+    return result?.choices?.[0]?.message?.content || result?.response?.text || '';
+}
+
+function persistChatSession(req, {
+    isMeta,
+    result,
+    effectiveChatId,
+    sessionScope,
+    agentRequest
+}) {
+    if (isMeta || !result.chatId || result.error || !result.parentId) return;
+    if (effectiveChatId?.startsWith('chat_')) {
+        mapChatId(effectiveChatId, result.chatId);
     }
-    // Hermes always sends tools[] even when expecting a final prose answer after tool results.
-    const trimmed = typeof content === 'string' ? content.trim() : '';
-    if (trimmed.startsWith('{') && /tool_calls/i.test(trimmed)) {
-        logWarn(`Malformed tool_calls JSON from Qwen: ${trimmed.slice(0, 120)}...`);
-    } else if (trimmed) {
-        logDebug(`Tool mode: Qwen replied in prose (${trimmed.length} chars)`);
+    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
     }
 }
 
@@ -1176,6 +1147,226 @@ router.post('/chats', async (req, res) => {
     }
 });
 
+async function handleOpenAIChatCompletions(req, res, { logLabel = 'OpenAI-совместимый' } = {}) {
+    const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
+    const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
+    const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
+    const explicitParentId = extractParentHint(req);
+    const conversationHint = extractConversationHint(req);
+    const forceNewChat = shouldForceNewChat(req);
+
+    logInfo(`Получен ${logLabel} запрос${stream ? ' (stream)' : ''}`);
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        logError('Запрос без сообщений');
+        return res.status(400).json({ error: 'Сообщения не указаны' });
+    }
+
+    const isMeta = isOpenWebUiMetaRequest(messages);
+    const { combinedTools, toolChoice } = buildCombinedTools(tools, functions, tool_choice);
+    const {
+        effectiveChatId: resolvedChatId,
+        effectiveParentId: resolvedParentId,
+        sessionScope,
+        agentRequest
+    } = resolveOpenAIChatSession(req, {
+        explicitChatId,
+        explicitParentId,
+        conversationHint,
+        forceNewChat,
+        isMeta,
+        messages,
+        combinedTools
+    });
+    let effectiveChatId = resolvedChatId;
+    let effectiveParentId = resolvedParentId;
+
+    const systemMsg = messages.find(msg => msg.role === 'system');
+    const systemMessage = systemMsg ? systemMsg.content : null;
+
+    const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+    if (preparedInput.missingUser) {
+        logError('В запросе нет сообщений от пользователя');
+        return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
+    }
+
+    const messageContent = normalizeOpenAIMessageContent(preparedInput.messageContent);
+    const files = preparedInput.files || [];
+    if (preparedInput.folded) {
+        logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+    }
+
+    if (isMeta) {
+        effectiveChatId = null;
+        effectiveParentId = null;
+        logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
+    }
+
+    let mappedModel = model ? getMappedModel(model) : 'qwen-max-latest';
+    if (model && mappedModel !== model) {
+        logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
+    }
+    logInfo(`Используется модель: ${mappedModel}`);
+
+    const hasTools = hasHermesTools(combinedTools, isMeta);
+    const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
+    const qwenTools = null;
+
+    logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
+    if (effectiveChatId) {
+        logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
+    }
+    if (agentRequest) {
+        logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
+    }
+
+    if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Transfer-Encoding', 'chunked');
+
+        const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
+        const streamId = 'chatcmpl-stream';
+
+        try {
+            const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+            let streamingCallback = null;
+            let hasStreamedChunks = false;
+
+            if (!hasTools) {
+                streamingCallback = (chunk) => {
+                    hasStreamedChunks = true;
+                    writeSse({
+                        id: streamId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel,
+                        choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }]
+                    });
+                };
+            }
+
+            const result = await sendMessage(
+                messageContent, mappedModel, qwenChatId, effectiveParentId, files,
+                qwenTools, tool_choice, toolAwareSystemMessage,
+                't2t', null, true, 0, streamingCallback
+            );
+
+            if (!result.error) {
+                persistChatSession(req, { isMeta, result, effectiveChatId, sessionScope, agentRequest });
+            }
+
+            if (result.error) {
+                writeSse({
+                    id: streamId, object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000), model: mappedModel,
+                    choices: [{ index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: null }]
+                });
+            } else if (hasTools) {
+                const content = extractAssistantContent(result);
+                const toolCalls = parseToolCallJson(content);
+                if (toolCalls?.length) {
+                    logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
+                    writeToolCallsSse(res, mappedModel, result, toolCalls);
+                    return;
+                }
+                if (content) {
+                    writeSse({
+                        id: streamId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000), model: mappedModel,
+                        choices: [{ index: 0, delta: { content }, finish_reason: null }]
+                    });
+                }
+            } else if (!hasStreamedChunks && result.choices?.[0]?.message?.content) {
+                const content = result.choices[0].message.content;
+                if (typeof streamingCallback === 'function') {
+                    streamingCallback(content);
+                } else {
+                    writeSse({
+                        id: streamId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000), model: mappedModel,
+                        choices: [{ index: 0, delta: { content }, finish_reason: null }]
+                    });
+                }
+            }
+
+            writeSse({
+                id: streamId, object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000), model: mappedModel,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            });
+            res.write('data: [DONE]\n\n');
+            res.end();
+        } catch (error) {
+            logError('Ошибка при обработке потокового запроса', error);
+            writeSse({
+                id: streamId, object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000), model: mappedModel,
+                choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
+            });
+            res.write('data: [DONE]\n\n');
+            res.end();
+        }
+        return;
+    }
+
+    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+    const result = await sendMessage(
+        messageContent, mappedModel, qwenChatId, effectiveParentId, files,
+        qwenTools, tool_choice, toolAwareSystemMessage
+    );
+
+    if (result.error) {
+        return res.status(500).json({ error: { message: result.error, type: 'server_error' } });
+    }
+
+    persistChatSession(req, { isMeta, result, effectiveChatId, sessionScope, agentRequest });
+
+    const messageText = extractAssistantContent(result);
+    if (hasTools) {
+        const toolCalls = parseToolCallJson(messageText);
+        if (toolCalls?.length) {
+            logInfo(`Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(c => c.function?.name).filter(Boolean).join(', ')}`);
+            return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
+        }
+    }
+
+    const openaiResponse = {
+        id: result.id || 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: result.model || mappedModel,
+        choices: [{
+            index: 0,
+            message: { role: 'assistant', content: messageText },
+            finish_reason: 'stop'
+        }],
+        usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        chatId: result.chatId,
+        parentId: result.parentId,
+        x_qwen_chat_id: result.chatId,
+        x_qwen_parent_id: result.parentId || result.response_id
+    };
+
+    if (result.chatId) {
+        try {
+            const currentChat = loadHistory(result.chatId);
+            saveHistory(result.chatId, {
+                ...currentChat,
+                messages: messages.concat([{ role: 'assistant', content: messageText }])
+            });
+        } catch (e) {
+            logDebug(`Не удалось сохранить историю: ${e.message}`);
+        }
+    }
+
+    return res.json(openaiResponse);
+}
+
 router.get('/chat/completions', (req, res) => {
     res.status(405).json({
         error: 'Метод не поддерживается',
@@ -1185,620 +1376,21 @@ router.get('/chat/completions', (req, res) => {
 
 router.post('/chat/completions', async (req, res) => {
     try {
-        const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
-        const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
-        const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
-        const explicitParentId = extractParentHint(req);
-        const conversationHint = extractConversationHint(req);
-        const forceNewChat = shouldForceNewChat(req);
-        logInfo(`Получен OpenAI-совместимый запрос${stream ? ' (stream)' : ''}`);
-
-        if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Запрос без сообщений');
-            return res.status(400).json({ error: 'Сообщения не указаны' });
-        }
-
-        const isMeta = isOpenWebUiMetaRequest(messages);
-        const { combinedTools, toolChoice } = buildCombinedTools(tools, functions, tool_choice);
-        const {
-            effectiveChatId: resolvedChatId,
-            effectiveParentId: resolvedParentId,
-            sessionScope,
-            agentRequest
-        } = resolveOpenAIChatSession(req, {
-            explicitChatId,
-            explicitParentId,
-            conversationHint,
-            forceNewChat,
-            isMeta,
-            messages,
-            combinedTools
-        });
-        let effectiveChatId = resolvedChatId;
-        let effectiveParentId = resolvedParentId;
-
-        // Извлекаем system message если есть
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
-
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
-        if (preparedInput.missingUser) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
-        }
-
-        let messageContent = preparedInput.messageContent;
-        
-        // Преобразуем OpenAI format content array во внутренний формат
-        if (Array.isArray(messageContent)) {
-            messageContent = messageContent.map(item => {
-                if (item.type === 'text') {
-                    return { type: 'text', text: item.text };
-                } else if (item.type === 'image_url' && item.image_url) {
-                    return { type: 'image', image: item.image_url.url };
-                } else if (item.type === 'image') {
-                    return { type: 'image', image: item.image };
-                }
-                return item;
-            });
-        }
-        
-        const files = preparedInput.files || [];
-        if (preparedInput.folded) {
-            logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-        }
-
-        if (isMeta) {
-            effectiveChatId = null;
-            effectiveParentId = null;
-            logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
-        }
-
-        let mappedModel = model ? getMappedModel(model) : "qwen-max-latest";
-        if (model && mappedModel !== model) {
-            logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
-        }
-        logInfo(`Используется модель: ${mappedModel}`);
-
-        const qwenTools = null;
-        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools, messages);
-        if (toolAwareSystemMessage) {
-            logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
-        }
-
-        logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
-        if (effectiveChatId) {
-            logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
-        }
-        if (agentRequest) {
-            logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
-        }
-
-        const captureToolCalls = shouldCaptureToolCalls(messages, combinedTools, isMeta);
-
-        if (stream) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-            res.setHeader('Pragma', 'no-cache');
-            res.setHeader('Expires', '0');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Accel-Buffering', 'no');
-            res.setHeader('Transfer-Encoding', 'chunked');
-
-            const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
-            };
-
-            try {
-                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-                // Setup streaming callback if stream=true
-                let streamingCallback = null;
-                let hasStreamedChunks = false;
-                if (stream && !captureToolCalls) {
-                    streamingCallback = (chunk) => {
-                        hasStreamedChunks = true;
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
-                    };
-                }
-
-                const result = await sendMessage(
-                    messageContent,
-                    mappedModel,
-                    qwenChatId,
-                    effectiveParentId,
-                    files,
-                    qwenTools,
-                    tool_choice,
-                    toolAwareSystemMessage,
-                    't2t',
-                    null,
-                    true,
-                    0,
-                    streamingCallback
-                );
-
-                if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
-                    purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
-                }
-
-                // Сохраняем chatId в сессию — только при успехе и непустом parentId,
-                // чтобы не перезаписать валидный parentId результатом ошибки.
-                if (!isMeta && result.chatId && !result.error && result.parentId) {
-                    // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
-                    if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                        mapChatId(effectiveChatId, result.chatId);
-                        logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
-                    }
-                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                    }
-                }
-
-                if (result.error) {
-                    writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || 'qwen-max-latest',
-                        choices: [
-                            { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: null }
-                        ]
-                    });
-                } else if (captureToolCalls) {
-                    const responseContent = result?.choices?.[0]?.message?.content;
-                    const toolCalls = parseToolCallJson(responseContent);
-                    logToolCallOutcome(responseContent, toolCalls);
-                    if (toolCalls?.length) {
-                        writeToolCallsSse(res, mappedModel, result, toolCalls);
-                        return;
-                    }
-                    if (responseContent) {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [{ index: 0, delta: { content: responseContent }, finish_reason: null }]
-                        });
-                    }
-                } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
-                    const content = result.choices[0].message.content;
-                    logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
-                    }
-                } else {
-                    logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
-                }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
-
-                writeSse({
-                    id: 'chatcmpl-stream',
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: mappedModel || 'qwen-max-latest',
-                    choices: [
-                        { index: 0, delta: {}, finish_reason: 'stop' }
-                    ]
-                });
-                res.write('data: [DONE]\n\n');
-                res.end();
-
-            } catch (error) {
-                logError('Ошибка при обработке потокового запроса', error);
-                writeSse({
-                    id: 'chatcmpl-stream',
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: mappedModel || 'qwen-max-latest',
-                    choices: [
-                        { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                    ]
-                });
-                res.write('data: [DONE]\n\n');
-                res.end();
-            }
-        } else {
-            const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
-
-            if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
-                purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
-            }
-
-            if (result.error) {
-                return res.status(500).json({
-                    error: { message: result.error, type: "server_error" }
-                });
-            }
-
-            if (!isMeta && result.chatId && result.parentId) {
-                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                }
-            }
-
-            if (captureToolCalls) {
-                const responseContent = result?.choices?.[0]?.message?.content;
-                const toolCalls = parseToolCallJson(responseContent);
-                logToolCallOutcome(responseContent, toolCalls);
-                if (toolCalls?.length) {
-                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                }
-            }
-
-            const openaiResponse = {
-                id: result.id || "chatcmpl-" + Date.now(),
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: result.model || mappedModel || "qwen-max-latest",
-                choices: result.choices || [{
-                    index: 0,
-                    message: {
-                        role: "assistant",
-                        content: result.choices?.[0]?.message?.content || ""
-                    },
-                    finish_reason: "stop"
-                }],
-                usage: result.usage || {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0
-                },
-                chatId: result.chatId,
-                parentId: result.parentId
-            };
-
-            // Сохраняем историю чата
-            if (result.chatId) {
-                try {
-                    const currentChat = loadHistory(result.chatId);
-                    const responseMessage = {
-                        role: 'assistant',
-                        content: openaiResponse.choices[0].message.content
-                    };
-                    const updatedMessages = messages.concat([responseMessage]);
-                    saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
-                } catch (e) {
-                    logDebug(`Не удалось сохранить историю: ${e.message}`);
-                }
-            }
-
-            res.json(openaiResponse);
-        }
+        await handleOpenAIChatCompletions(req, res, { logLabel: 'OpenAI-совместимый' });
     } catch (error) {
         logError('Ошибка при обработке запроса', error);
-        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: "server_error" } });
+        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: 'server_error' } });
     }
 });
 
-// OpenAI совместимый эндпоинт v1 (для Open WebUI и других клиентов)
 router.post('/v1/chat/completions', async (req, res) => {
     try {
-        const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
-        const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
-        const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
-        const explicitParentId = extractParentHint(req);
-        const conversationHint = extractConversationHint(req);
-        const forceNewChat = shouldForceNewChat(req);
-
-        logInfo(`Получен OpenAI v1 запрос${stream ? ' (stream)' : ''}`);
-
-        if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Запрос без сообщений');
-            return res.status(400).json({ error: 'Сообщения не указаны' });
-        }
-
-        const isMeta = isOpenWebUiMetaRequest(messages);
-        const { combinedTools, toolChoice } = buildCombinedTools(tools, functions, tool_choice);
-        const {
-            effectiveChatId: resolvedChatId,
-            effectiveParentId: resolvedParentId,
-            sessionScope,
-            agentRequest
-        } = resolveOpenAIChatSession(req, {
-            explicitChatId,
-            explicitParentId,
-            conversationHint,
-            forceNewChat,
-            isMeta,
-            messages,
-            combinedTools
-        });
-        let effectiveChatId = resolvedChatId;
-        let effectiveParentId = resolvedParentId;
-
-        // Извлекаем system message если есть
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
-
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
-        if (preparedInput.missingUser) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
-        }
-
-        let messageContent = preparedInput.messageContent;
-        
-        if (Array.isArray(messageContent)) {
-            messageContent = messageContent.map(item => {
-                if (item.type === 'text') {
-                    return { type: 'text', text: item.text };
-                } else if (item.type === 'image_url' && item.image_url) {
-                    return { type: 'image', image: item.image_url.url };
-                } else if (item.type === 'image') {
-                    return { type: 'image', image: item.image };
-                }
-                return item;
-            });
-        }
-        
-        const files = preparedInput.files || [];
-        if (preparedInput.folded) {
-            logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-        }
-
-        if (isMeta) {
-            effectiveChatId = null;
-            effectiveParentId = null;
-            logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
-        }
-
-        let mappedModel = model ? getMappedModel(model) : "qwen-max-latest";
-        if (model && mappedModel !== model) {
-            logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
-        }
-        logInfo(`Используется модель: ${mappedModel}`);
-
-        const qwenTools = null;
-        const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools, messages);
-        if (toolAwareSystemMessage) {
-            logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
-        }
-
-        logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
-        if (effectiveChatId) {
-            logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
-        }
-        if (agentRequest) {
-            logInfo(`Agent tool session scope: ${sessionScope || 'unscoped'}`);
-        }
-
-        const captureToolCalls = shouldCaptureToolCalls(messages, combinedTools, isMeta);
-
-        if (stream) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-            res.setHeader('Pragma', 'no-cache');
-            res.setHeader('Expires', '0');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Accel-Buffering', 'no');
-            res.setHeader('Transfer-Encoding', 'chunked');
-
-            const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
-            };
-
-            try {
-                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-                // Setup streaming callback if stream=true
-                let streamingCallback = null;
-                let hasStreamedChunks = false;
-                if (stream && !captureToolCalls) {
-                    streamingCallback = (chunk) => {
-                        hasStreamedChunks = true;
-                        // OpenWebUI не нуждается в role в чанках - только контент
-                        writeSse({
-                            id: 'chatcmpl-' + Date.now(),
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
-                    };
-                }
-
-                const result = await sendMessage(
-                    messageContent,
-                    mappedModel,
-                    qwenChatId,
-                    effectiveParentId,
-                    files,
-                    qwenTools,
-                    tool_choice,
-                    toolAwareSystemMessage,
-                    't2t',
-                    null,
-                    true,
-                    0,
-                    streamingCallback
-                );
-
-                if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
-                    purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
-                }
-
-                if (!isMeta && result.chatId && !result.error && result.parentId) {
-                    if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                        saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                    }
-                }
-
-                if (result.error) {
-                    writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || 'qwen-max-latest',
-                        choices: [
-                            { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: 'stop' }
-                        ]
-                    });
-                } else if (captureToolCalls) {
-                    const responseContent = result?.choices?.[0]?.message?.content;
-                    const toolCalls = parseToolCallJson(responseContent);
-                    logToolCallOutcome(responseContent, toolCalls);
-                    if (toolCalls?.length) {
-                        writeToolCallsSse(res, mappedModel, result, toolCalls);
-                        return;
-                    }
-                    if (responseContent) {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [{ index: 0, delta: { content: responseContent }, finish_reason: null }]
-                        });
-                    }
-                } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
-                    const content = result.choices[0].message.content;
-                    logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
-                    }
-                } else {
-                    logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
-                }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
-
-                writeSse({
-                    id: 'chatcmpl-stream',
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: mappedModel || 'qwen-max-latest',
-                    choices: [
-                        { index: 0, delta: {}, finish_reason: 'stop' }
-                    ]
-                });
-                res.write('data: [DONE]\n\n');
-                res.end();
-
-            } catch (error) {
-                logError('Ошибка при обработке потокового запроса', error);
-                writeSse({
-                    id: 'chatcmpl-stream',
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: mappedModel || 'qwen-max-latest',
-                    choices: [
-                        { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                    ]
-                });
-                res.write('data: [DONE]\n\n');
-                res.end();
-            }
-        } else {
-            const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
-
-            if (result.staleChat || isStaleChatErrorText(result.details || result.error)) {
-                purgeStaleChatBindings(req, sessionScope, qwenChatId, effectiveChatId);
-            }
-
-            if (result.error) {
-                return res.status(500).json({
-                    error: { message: result.error, type: "server_error" }
-                });
-            }
-
-            // Извлекаем контент сообщения
-            let messageText = '';
-            if (result.choices && result.choices[0] && result.choices[0].message) {
-                messageText = result.choices[0].message.content || '';
-            } else if (result.response && result.response.text) {
-                messageText = result.response.text;
-            }
-
-            if (captureToolCalls) {
-                const toolCalls = parseToolCallJson(messageText);
-                logToolCallOutcome(messageText, toolCalls);
-                if (toolCalls?.length) {
-                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                }
-            }
-
-            if (!isMeta && result.chatId && result.parentId) {
-                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, sessionScope);
-                }
-            }
-
-            const openaiResponse = {
-                id: result.id || "chatcmpl-" + Date.now(),
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: result.model || mappedModel || "qwen-max-latest",
-                choices: [{
-                    index: 0,
-                    message: {
-                        role: "assistant",
-                        content: messageText
-                    },
-                    finish_reason: "stop"
-                }],
-                usage: result.usage || {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0
-                },
-                x_qwen_chat_id: result.chatId,
-                x_qwen_parent_id: result.parentId || result.response_id
-            };
-
-            if (result.chatId) {
-                try {
-                    const currentChat = loadHistory(result.chatId);
-                    const responseMessage = { role: 'assistant', content: messageText };
-                    saveHistory(result.chatId, { ...currentChat, messages: messages.concat([responseMessage]) });
-                } catch (e) {
-                    logDebug(`Не удалось сохранить историю: ${e.message}`);
-                }
-            }
-
-            res.json(openaiResponse);
-        }
+        await handleOpenAIChatCompletions(req, res, { logLabel: 'OpenAI v1' });
     } catch (error) {
         logError('Ошибка при обработке v1 запроса', error);
-        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: "server_error" } });
+        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: 'server_error' } });
     }
 });
-
 router.post('/files/getstsToken', async (req, res) => {
     try {
         logInfo(`Запрос на получение STS токена: ${JSON.stringify(req.body)}`);
