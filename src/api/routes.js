@@ -508,19 +508,15 @@ function hasOpenAIToolState(messages) {
     );
 }
 
-function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId, effectiveParentId) {
+function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
     const nonSystemMessages = (messages || []).filter(msg => msg && msg.role !== 'system');
     if (nonSystemMessages.length === 0) return false;
 
-    // When we have a live Qwen chat session (chatId + parentId), Qwen's server already
-    // holds all prior context. Folding the full transcript would duplicate that history
-    // and pollute the prompt with past tool failures. Only send the latest delta.
-    if (effectiveChatId && effectiveParentId) return false;
-
-    // Hermes/OpenAI agents send the full state every request. After a tool call the
-    // next request often ends with role=tool, not role=user. Qwen Chat has no native
-    // OpenAI tool-result role, so preserving context means folding the whole OpenAI
-    // transcript into a single user message for that turn.
+    // Tool-calling conversations MUST fold the full transcript on EVERY turn.
+    // Qwen Chat's web memory does not preserve OpenAI tool-call discipline across turns,
+    // so relying on the live session (sending only the latest delta) makes Qwen "forget"
+    // it should emit tool_calls JSON and reply in prose. Folding keeps the whole OpenAI
+    // transcript — including the tool-call format — visible to Qwen each turn.
     if (hasOpenAIToolState(messages)) return true;
 
     // If FreeQwenApi is used as a stateless OpenAI-compatible endpoint and no
@@ -535,59 +531,16 @@ function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId, ef
     return false;
 }
 
-// Extract the latest "delta" to send when Qwen's server already has history:
-// the last user message plus any tool results that immediately precede it
-// (i.e. tool results from the previous assistant tool_calls turn).
-function buildLatestDelta(messages) {
-    const nonSystem = (messages || []).filter(msg => msg && msg.role !== 'system');
-
-    // Collect trailing tool results + the final user message
-    const parts = [];
-    for (let i = nonSystem.length - 1; i >= 0; i--) {
-        const msg = nonSystem[i];
-        if (msg.role === 'user' || msg.role === 'tool' || msg.role === 'function') {
-            parts.unshift(msg);
-        } else {
-            break;
-        }
-    }
-
-    if (parts.length === 0) return null;
-
-    // Format as a compact message Qwen can understand
-    const lines = parts.map(msg => {
-        if (msg.role === 'user') return stringifyOpenAIContent(msg.content);
-        const name = msg.name || msg.tool_call_id || 'tool';
-        return `Tool result (${name}): ${stringifyOpenAIContent(msg.content)}`;
-    }).filter(Boolean);
-
-    return lines.join('\n\n') || null;
-}
-
-function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId) {
+function prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId) {
     const lastUserMessage = (messages || []).filter(msg => msg && msg.role === 'user').pop();
 
-    if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId, effectiveParentId)) {
+    if (shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId)) {
         return {
             messageContent: buildStatelessTranscript(messages),
             files: lastUserMessage?.files || [],
             folded: true,
             missingUser: false
         };
-    }
-
-    // Live session — send only the latest delta (last user msg + trailing tool results)
-    if (effectiveChatId && effectiveParentId && hasOpenAIToolState(messages)) {
-        const delta = buildLatestDelta(messages);
-        if (delta) {
-            return {
-                messageContent: delta,
-                files: lastUserMessage?.files || [],
-                folded: false,
-                delta: true,
-                missingUser: false
-            };
-        }
     }
 
     if (!lastUserMessage) {
@@ -761,7 +714,7 @@ function logToolCallRequest(messageContent, toolAwareSystemMessage, combinedTool
         .map(t => t?.function?.name || t?.name)
         .filter(Boolean)
         .join(', ');
-    const mode = preparedInput?.delta ? 'delta' : preparedInput?.folded ? 'folded-transcript' : 'plain';
+    const mode = preparedInput?.folded ? 'folded-transcript' : 'plain';
     const msgStr = typeof messageContent === 'string'
         ? messageContent
         : JSON.stringify(messageContent, null, 2);
@@ -1244,7 +1197,7 @@ router.post('/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
 
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId);
+        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
             logError('В запросе нет сообщений от пользователя');
             return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
@@ -1269,8 +1222,6 @@ router.post('/chat/completions', async (req, res) => {
         const files = preparedInput.files || [];
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-        } else if (preparedInput.delta) {
-            logInfo('Live session: sending latest delta only (Qwen server holds prior context)');
         }
 
         if (isMeta) {
@@ -1548,7 +1499,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
 
-        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId, effectiveParentId);
+        const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
             logError('В запросе нет сообщений от пользователя');
             return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
@@ -1572,8 +1523,6 @@ router.post('/v1/chat/completions', async (req, res) => {
         const files = preparedInput.files || [];
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-        } else if (preparedInput.delta) {
-            logInfo('Live session: sending latest delta only (Qwen server holds prior context)');
         }
 
         if (isMeta) {

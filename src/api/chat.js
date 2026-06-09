@@ -746,8 +746,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // Drop chatId so a new chat is created on the new account.
-            // Context is safe to lose here: tool-call turns always use a folded transcript
-            // that carries full history in the message itself.
+            // Context is safe to lose here: tool-call turns always fold the full transcript
+            // into the message itself, so `message` already carries the complete history.
             logInfo(`Аккаунт сменился — создаём новый чат для повтора (был: ${chatId})`);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
@@ -759,7 +759,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         let hours = 24;
         try {
             const rateInfo = JSON.parse(response.errorBody);
-            hours = Number(rateInfo.num) || 24;
+            hours = Number(rateInfo.data?.num ?? rateInfo.num) || 24;
         } catch { /* errorBody might not be valid JSON */ }
 
         if (tokenObj?.id === 'browser') {
@@ -774,6 +774,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // Drop chatId — the new account cannot access the old account's Qwen chat.
+            // Tool-call turns fold the full transcript into `message`, so context is preserved.
             logInfo(`Аккаунт сменился после rate-limit — создаём новый чат для повтора (был: ${chatId})`);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
