@@ -510,6 +510,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
                     if (chunk['response.created']) responseId = chunk['response.created'].response_id;
                     if (chunk.response_id) responseId = chunk.response_id;
+                    if (!responseId && chunk.id && chunk.id !== 'chatcmpl-') responseId = chunk.id;
 
                     if (chunk.choices && chunk.choices[0]) {
                         const delta = chunk.choices[0].delta;
@@ -788,13 +789,10 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     if (!chatId) {
-        // Pre-select the account BEFORE creating the chat so the chat is owned by
-        // the same account that will send the first message (sticky routing).
-        const preToken = await getAvailableToken(null);
-        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, preToken?.id ?? null);
+        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType);
         if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
         chatId = newChatResult.chatId;
-        // Bind this chatId to the account so all subsequent turns use the same login.
+        // Bind this chatId to the account so subsequent turns use the same login (sticky routing).
         if (chatId && newChatResult.accountId) {
             assignChatAccount(chatId, newChatResult.accountId);
         }
@@ -1033,19 +1031,11 @@ export function getAuthToken() {
 
 // ─── createChatV2 ────────────────────────────────────────────────────────────
 
-export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t', preferredAccountId = null) {
+export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t') {
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован' };
 
-    // Use a preferred account when the caller has already committed to one (sticky routing).
-    const tokenObj = preferredAccountId
-        ? (await (async () => {
-              const { loadTokens } = await import('./tokenManager.js');
-              const all = loadTokens();
-              const t = all.find(t => t.id === preferredAccountId && !t.invalid && (!t.resetAt || new Date(t.resetAt).getTime() <= Date.now()));
-              return t || await getAvailableToken(null);
-          })())
-        : await getAvailableToken(null);
+    const tokenObj = await getAvailableToken(null);
 
     let usedAccountId = null;
     if (tokenObj?.token) {
@@ -1094,7 +1084,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         if (isTransient && retryCount < MAX_RETRY_COUNT) {
             logWarn(`Создание чата: ${result.status}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`);
             await delay(RETRY_DELAY);
-            return createChatV2(model, title, retryCount + 1, chatType, preferredAccountId);
+            return createChatV2(model, title, retryCount + 1, chatType);
         }
 
         const cleanError = isTransient

@@ -1,5 +1,5 @@
 import express from 'express';
-import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken } from './chat.js';
+import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, testToken } from './chat.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
@@ -142,11 +142,6 @@ function shouldForceNewChat(req) {
         req.get?.('x-new-chat'),
         req.get?.('x-reset-chat')
     ].some(isTruthyFlag);
-}
-
-function shouldPersistSessionContext(scope = null) {
-    const normalizedScope = normalizeIdValue(scope);
-    return Boolean(normalizedScope) || ALLOW_UNSCOPED_SESSION_CHAT_RESTORE;
 }
 
 function isContextSynthesisRequest(messages) {
@@ -299,7 +294,6 @@ async function resolveQwenChatId(effectiveChatId, mappedModel) {
 
     return qwenChatId;
 }
-import { testToken } from './chat.js';
 
 function isOpenWebUiMetaRequest(messages) {
     if (!Array.isArray(messages) || messages.length === 0) return false;
@@ -1270,11 +1264,9 @@ router.post('/chat/completions', async (req, res) => {
             logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
         }
         logInfo(`Используется модель: ${mappedModel}`);
-        if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
 
         const qwenTools = null;
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
-
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
@@ -1327,7 +1319,7 @@ router.post('/chat/completions', async (req, res) => {
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ПЕРЕДАЁМ FILES
+                    files,
                     qwenTools,
                     tool_choice,
                     toolAwareSystemMessage,
@@ -1421,23 +1413,18 @@ router.post('/chat/completions', async (req, res) => {
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage);
-
-            // Сохраняем chatId в сессию для следующих запросов
-            if (!isMeta && result.chatId) {
-                if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                    mapChatId(effectiveChatId, result.chatId);
-                    logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
-                }
-                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                }
-            }
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
 
             if (result.error) {
                 return res.status(500).json({
                     error: { message: result.error, type: "server_error" }
                 });
+            }
+
+            if (!isMeta && result.chatId && result.parentId) {
+                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
+                }
             }
 
             const responseContent = result?.choices?.[0]?.message?.content;
@@ -1573,10 +1560,6 @@ router.post('/v1/chat/completions', async (req, res) => {
             logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
         }
         logInfo(`Используется модель: ${mappedModel}`);
-
-        if (systemMessage) {
-            logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
-        }
 
         const qwenTools = null;
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
@@ -1723,18 +1706,6 @@ router.post('/v1/chat/completions', async (req, res) => {
 
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
 
-            // Сохраняем chatId в сессии для следующих запросов
-            if (!isMeta && result.chatId) {
-                // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
-                if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                    mapChatId(effectiveChatId, result.chatId);
-                    logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
-                }
-                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                    saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
-                }
-            }
-
             if (result.error) {
                 return res.status(500).json({
                     error: { message: result.error, type: "server_error" }
@@ -1757,6 +1728,12 @@ router.post('/v1/chat/completions', async (req, res) => {
                 return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
             }
 
+            if (!isMeta && result.chatId && result.parentId) {
+                if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
+                    saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, sessionScope);
+                }
+            }
+
             const openaiResponse = {
                 id: result.id || "chatcmpl-" + Date.now(),
                 object: "chat.completion",
@@ -1775,32 +1752,15 @@ router.post('/v1/chat/completions', async (req, res) => {
                     completion_tokens: 0,
                     total_tokens: 0
                 },
-                // Передаём метаданные для сохранения контекста
                 x_qwen_chat_id: result.chatId,
                 x_qwen_parent_id: result.parentId || result.response_id
             };
 
-            // Сохраняем историю чата для v1 эндпоинта
             if (result.chatId) {
-                // Сохраняем chatId в сессии для последующих запросов от этого клиента
-                if (!isMeta) {
-                    try {
-                        if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
-                            saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, sessionScope);
-                        }
-                    } catch (e) {
-                        logDebug(`Не удалось сохранить chatId в сессии: ${e.message}`);
-                    }
-                }
-
                 try {
                     const currentChat = loadHistory(result.chatId);
-                    const responseMessage = {
-                        role: 'assistant',
-                        content: messageText
-                    };
-                    const updatedMessages = messages.concat([responseMessage]);
-                    saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
+                    const responseMessage = { role: 'assistant', content: messageText };
+                    saveHistory(result.chatId, { ...currentChat, messages: messages.concat([responseMessage]) });
                 } catch (e) {
                     logDebug(`Не удалось сохранить историю: ${e.message}`);
                 }

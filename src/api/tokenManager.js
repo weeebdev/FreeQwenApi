@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logError, logInfo, logWarn } from '../logger/index.js';
-import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
+import { SESSION_DIR, ACCOUNTS_DIR, ACCOUNT_COOLDOWN_MS, CHAT_STICKY_TTL_MS } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,10 +18,6 @@ const accountStats = new Map();
 
 /** @type {Map<string, { accountId: string, assignedAt: number }>} */
 const chatAccountMap = new Map();
-
-// Configurable via env — read once at module load so they're hot during requests.
-const CHAT_STICKY_TTL_MS = Number(process.env.CHAT_STICKY_TTL_MS) || 60 * 60 * 1000; // 1h
-const ACCOUNT_COOLDOWN_MS = Number(process.env.ACCOUNT_COOLDOWN_MS) || 500; // ms gap before reusing same account
 
 function ensureSessionDir() {
     if (!fs.existsSync(SESSION_PATH)) fs.mkdirSync(SESSION_PATH, { recursive: true });
