@@ -209,6 +209,12 @@ function resolveOpenAIChatSession(req, {
             } else {
                 if (savedSession?.chatId && !savedSession?.parentId) {
                     logWarn(`Discarding stale agent session (parentId null) for scope ${sessionScope}, creating fresh chat`);
+                    // Also purge the chatIdMap entry so resolveQwenChatId doesn't reuse the broken Qwen chat
+                    for (const [k, v] of chatIdMap.entries()) {
+                        if (v === savedSession.chatId) { chatIdMap.delete(k); break; }
+                    }
+                    const staleKey = getScopedSessionKey(req, sessionScope);
+                    sessionToChatMap.delete(staleKey);
                 }
                 effectiveChatId = generateChatIdFromHistory(messages);
                 if (effectiveChatId) {
@@ -1284,8 +1290,9 @@ router.post('/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
-                // Сохраняем chatId в сессию для следующих запросов (до return, чтобы не пропустить при tool calls)
-                if (!isMeta && result.chatId) {
+                // Сохраняем chatId в сессию — только при успехе и непустом parentId,
+                // чтобы не перезаписать валидный parentId результатом ошибки.
+                if (!isMeta && result.chatId && !result.error && result.parentId) {
                     // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
                     if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
                         mapChatId(effectiveChatId, result.chatId);
@@ -1591,8 +1598,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
-                // Сохраняем chatId в сессию для следующих запросов (до return, чтобы не пропустить при tool calls)
-                if (!isMeta && result.chatId) {
+                if (!isMeta && result.chatId && !result.error && result.parentId) {
                     if (shouldPersistOpenAISession(sessionScope, agentRequest)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, sessionScope);
                     }

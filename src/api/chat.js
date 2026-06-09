@@ -711,8 +711,8 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, tools = null, toolChoice = null, systemMessage = null) {
     logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
-    if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
+    logError(`Ошибка при получении ответа: ${response.error || response.statusText || `HTTP ${response.status || 'unknown'}`}`);
+    if (response.errorBody) logWarn(`Тело ответа с ошибкой: ${response.errorBody.substring(0, 300)}`);
 
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
